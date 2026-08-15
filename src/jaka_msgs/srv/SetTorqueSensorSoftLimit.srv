@@ -1,0 +1,6 @@
+# Fx, Fy, Fz (N), Tx, Ty, Tz (N*m)
+float64[6] limits
+---
+bool success
+int32 error_code
+string message

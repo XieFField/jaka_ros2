@@ -4,6 +4,7 @@
 #include "std_srvs/srv/set_bool.hpp"
 #include "std_srvs/srv/trigger.hpp"
 #include "geometry_msgs/msg/twist_stamped.hpp"
+#include "geometry_msgs/msg/wrench_stamped.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
 
 #include "Eigen/Dense"
@@ -24,11 +25,15 @@
 #include "jaka_msgs/srv/get_fk.hpp"
 #include "jaka_msgs/srv/get_ik.hpp"
 #include "jaka_msgs/srv/clear_error.hpp"
+#include "jaka_msgs/srv/set_admittance_config.hpp"
+#include "jaka_msgs/srv/set_torque_sensor_soft_limit.hpp"
 
 #include "jaka_driver/JAKAZuRobot.h"
 #include "jaka_driver/jkerr.h"
 #include "jaka_driver/jktypes.h"
 #include "jaka_driver/conversion.h"
+#include "jaka_driver/follow_joint_trajectory_server.hpp"
+#include "jaka_driver/control_ownership.hpp"
 
 #include <action_msgs/msg/goal_status_array.hpp>
 #include <control_msgs/action/follow_joint_trajectory.hpp>
@@ -36,6 +41,7 @@
 
 #include <string>
 #include <map>
+#include <cmath>
 #include <chrono>
 #include <thread>
 #include <atomic>
@@ -67,18 +73,257 @@ map<int, string>mapErr = {
     {-12,"ERR_MOTION_ABNORMAL"}
 };
 
-std::string robot_ip = "10.5.5.100";
+std::string robot_ip;
 std::atomic<bool> sdk_logged_in{false};
 std::mutex session_mutex;
+std::atomic<jaka_driver::ControlOwner> control_owner{
+    jaka_driver::ControlOwner::kIdle};
+std::weak_ptr<jaka_driver::FollowJointTrajectoryServer> trajectory_server;
+
+std::string sdk_error_text(int code)
+{
+    const auto iterator = mapErr.find(code);
+    if (iterator != mapErr.end())
+    {
+        return iterator->second;
+    }
+    return "JAKA_SDK_ERROR(" + std::to_string(code) + ")";
+}
+
+bool claim_legacy_control()
+{
+    if (control_owner.load() == jaka_driver::ControlOwner::kLegacyMotion)
+    {
+        return true;
+    }
+    return jaka_driver::try_acquire_control(
+        control_owner, jaka_driver::ControlOwner::kLegacyMotion);
+}
+
+class ScopedLegacyControl
+{
+public:
+    ScopedLegacyControl()
+        : acquired_(jaka_driver::try_acquire_control(
+              control_owner, jaka_driver::ControlOwner::kLegacyMotion))
+    {
+    }
+
+    ~ScopedLegacyControl()
+    {
+        if (acquired_)
+        {
+            jaka_driver::release_control(
+                control_owner, jaka_driver::ControlOwner::kLegacyMotion);
+        }
+    }
+
+    bool acquired() const {return acquired_;}
+
+private:
+    bool acquired_;
+};
 
 // Declare publishers
 rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr tool_position_pub;
 rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_position_pub;
+rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_pub;
 rclcpp::Publisher<jaka_msgs::msg::RobotMsg>::SharedPtr robot_state_pub;
+rclcpp::Publisher<geometry_msgs::msg::WrenchStamped>::SharedPtr wrench_pub;
+std::string ft_frame_id = "Link_06";
+int ft_data_type = 3;
+
+void wrench_callback(
+    const rclcpp::Publisher<geometry_msgs::msg::WrenchStamped>::SharedPtr & publisher)
+{
+    TorqSensorData sensor_data{};
+    const int ret = robot.get_torque_sensor_data(ft_data_type, &sensor_data);
+    if (ret != 0)
+    {
+        return;
+    }
+
+    geometry_msgs::msg::WrenchStamped message;
+    message.header.stamp = rclcpp::Clock().now();
+    message.header.frame_id = ft_frame_id;
+    message.wrench.force.x = sensor_data.data.fx;
+    message.wrench.force.y = sensor_data.data.fy;
+    message.wrench.force.z = sensor_data.data.fz;
+    message.wrench.torque.x = sensor_data.data.tx;
+    message.wrench.torque.y = sensor_data.data.ty;
+    message.wrench.torque.z = sensor_data.data.tz;
+    publisher->publish(message);
+}
+
+void set_torque_sensor_soft_limit_callback(
+    const std::shared_ptr<jaka_msgs::srv::SetTorqueSensorSoftLimit::Request> request,
+    std::shared_ptr<jaka_msgs::srv::SetTorqueSensorSoftLimit::Response> response)
+{
+    for (const double value : request->limits)
+    {
+        if (!std::isfinite(value) || value <= 0.0)
+        {
+            response->success = false;
+            response->error_code = -2;
+            response->message = "All FT soft limits must be finite and positive";
+            return;
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(session_mutex);
+    if (!sdk_logged_in.load())
+    {
+        response->success = false;
+        response->error_code = -1;
+        response->message = "SDK is not logged in";
+        return;
+    }
+
+    FTxyz limits{
+        request->limits[0], request->limits[1], request->limits[2],
+        request->limits[3], request->limits[4], request->limits[5]};
+    const int ret = robot.set_torque_sensor_soft_limit(limits);
+    response->success = ret == 0;
+    response->error_code = ret;
+    response->message = ret == 0 ?
+        "Torque sensor soft limits configured" :
+        "set_torque_sensor_soft_limit failed: " + std::to_string(ret);
+}
+
+void set_admittance_config_callback(
+    const std::shared_ptr<jaka_msgs::srv::SetAdmittanceConfig::Request> request,
+    std::shared_ptr<jaka_msgs::srv::SetAdmittanceConfig::Response> response)
+{
+    if (request->axis < 0 || request->axis >= 6 ||
+        (request->option != 0 && request->option != 1) ||
+        !std::isfinite(request->target_wrench) ||
+        !std::isfinite(request->constant) ||
+        !std::isfinite(request->rebound))
+    {
+        response->success = false;
+        response->error_code = -2;
+        response->message = "Invalid admittance configuration";
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(session_mutex);
+    if (!sdk_logged_in.load())
+    {
+        response->success = false;
+        response->error_code = -1;
+        response->message = "SDK is not logged in";
+        return;
+    }
+    const int ret = robot.set_admit_ctrl_config(
+        request->axis,
+        request->option,
+        request->target_wrench,
+        request->constant,
+        request->normal_track,
+        request->rebound);
+    response->success = ret == 0;
+    response->error_code = ret;
+    response->message = ret == 0 ?
+        "Admittance axis configured" :
+        "set_admit_ctrl_config failed: " + std::to_string(ret);
+}
+
+void enable_admittance_callback(
+    const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+    std::shared_ptr<std_srvs::srv::SetBool::Response> response)
+{
+    if (request->data)
+    {
+        const auto owner = control_owner.load();
+        if (owner != jaka_driver::ControlOwner::kCompliance &&
+            !jaka_driver::try_acquire_control(
+                control_owner, jaka_driver::ControlOwner::kCompliance))
+        {
+            response->success = false;
+            response->message = std::string("Control is owned by ") +
+                jaka_driver::control_owner_name(control_owner.load());
+            return;
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(session_mutex);
+    if (!sdk_logged_in.load())
+    {
+        if (request->data)
+        {
+            jaka_driver::release_control(
+                control_owner, jaka_driver::ControlOwner::kCompliance);
+        }
+        response->success = false;
+        response->message = "SDK is not logged in";
+        return;
+    }
+
+    int ret = 0;
+    if (request->data)
+    {
+        int sensor_mode = 0;
+        ret = robot.get_torque_sensor_mode(&sensor_mode);
+        if (ret == 0 && sensor_mode == 0)
+        {
+            jaka_driver::release_control(
+                control_owner, jaka_driver::ControlOwner::kCompliance);
+            response->success = false;
+            response->message = "Torque sensor is not enabled";
+            return;
+        }
+        if (ret == 0)
+        {
+            ret = robot.enable_admittance_ctrl(1);
+        }
+    }
+    else
+    {
+        robot.motion_abort();
+        ret = robot.disable_force_control();
+        jaka_driver::release_control(
+            control_owner, jaka_driver::ControlOwner::kCompliance);
+    }
+    if (request->data && ret != 0)
+    {
+        jaka_driver::release_control(
+            control_owner, jaka_driver::ControlOwner::kCompliance);
+    }
+    response->success = ret == 0;
+    response->message = ret == 0 ?
+        (request->data ? "Admittance enabled" : "Force control disabled") :
+        "JAKA force-control operation failed: " + std::to_string(ret);
+}
+
+void zero_ft_sensor_callback(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+{
+    std::lock_guard<std::mutex> lock(session_mutex);
+    if (!sdk_logged_in.load())
+    {
+        response->success = false;
+        response->message = "SDK is not logged in";
+        return;
+    }
+    const int ret = robot.zero_end_sensor();
+    response->success = ret == 0;
+    response->message = ret == 0 ?
+        "FT sensor zeroing completed" :
+        "zero_end_sensor failed: " + std::to_string(ret);
+}
 
 bool linear_move_callback(const shared_ptr<jaka_msgs::srv::Move::Request> request,
     shared_ptr<jaka_msgs::srv::Move::Response> response)
 {
+    ScopedLegacyControl control;
+    if (!control.acquired())
+    {
+        response->ret = 0;
+        response->message = std::string("Control is owned by ") +
+            jaka_driver::control_owner_name(control_owner.load());
+        return false;
+    }
     if (request->pose.size() < 6)
     {
         response->ret = 0;
@@ -96,6 +341,7 @@ bool linear_move_callback(const shared_ptr<jaka_msgs::srv::Move::Request> reques
     end_pose.tran.z = request->pose[2];
     Eigen::Vector3d Angaxis = {request->pose[3], request->pose[4], request->pose[5]};
     RotMatrix Rot = Angaxis2Rot(Angaxis);
+    std::lock_guard<std::mutex> lock(session_mutex);
     robot.rot_matrix_to_rpy(&Rot, &(end_pose.rpy));
     
     // Eigen::AngleAxisd rotation_vector(Angaxis.norm(), Angaxis.normalized());
@@ -113,7 +359,7 @@ bool linear_move_callback(const shared_ptr<jaka_msgs::srv::Move::Request> reques
             break;
         default:
             response->ret = 0;
-            response->message = "error occurred:" + mapErr[ret];
+            response->message = "error occurred:" + sdk_error_text(ret);
             return false;
     }
 
@@ -124,6 +370,14 @@ bool linear_move_callback(const shared_ptr<jaka_msgs::srv::Move::Request> reques
 bool joint_move_callback(const shared_ptr<jaka_msgs::srv::Move::Request> request,
     shared_ptr<jaka_msgs::srv::Move::Response> response)
 {
+    ScopedLegacyControl control;
+    if (!control.acquired())
+    {
+        response->ret = 0;
+        response->message = std::string("Control is owned by ") +
+            jaka_driver::control_owner_name(control_owner.load());
+        return false;
+    }
     if (request->pose.size() < 6)
     {
         response->ret = 0;
@@ -142,6 +396,7 @@ bool joint_move_callback(const shared_ptr<jaka_msgs::srv::Move::Request> request
     double tol = 0.5;
     OptionalCond *option_cond = nullptr;
 
+    std::lock_guard<std::mutex> lock(session_mutex);
     int ret = robot.joint_move(&joint_pose, MoveMode::ABS, true, speed, accel, tol, option_cond);
     switch(ret)
     {
@@ -151,7 +406,7 @@ bool joint_move_callback(const shared_ptr<jaka_msgs::srv::Move::Request> request
             break;
         default:
             response->ret = 0;
-            response->message = "error occurred:" + mapErr[ret];
+            response->message = "error occurred:" + sdk_error_text(ret);
             return false;
     }
     return true;
@@ -160,6 +415,26 @@ bool joint_move_callback(const shared_ptr<jaka_msgs::srv::Move::Request> request
 bool jog_callback(const shared_ptr<jaka_msgs::srv::Move::Request> request,
     shared_ptr<jaka_msgs::srv::Move::Response> response)
 {
+    if (request->coord_mode < 0 || request->coord_mode > 2)
+    {
+        response->ret = 0;
+        response->message = "Invalid coordinate mode";
+        return false;
+    }
+    if (request->index < 0 || request->index > 11)
+    {
+        response->ret = 0;
+        response->message = "Invalid jog index";
+        return false;
+    }
+    if (!claim_legacy_control())
+    {
+        response->ret = 0;
+        response->message = std::string("Control is owned by ") +
+            jaka_driver::control_owner_name(control_owner.load());
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(session_mutex);
     // 1. Initialization parameters
     double move_velocity = 0;
     CoordType coord_type = COORD_JOINT;
@@ -192,19 +467,10 @@ bool jog_callback(const shared_ptr<jaka_msgs::srv::Move::Request> request,
             move_velocity = request->mvacc;
             break; 
         default:
-            RCLCPP_INFO(rclcpp::get_logger("jog_callback"), "Coordinate system input error, please re-enter");
-            response->ret = 0;
-            response->message = "Invalid coordinate mode";
-            return false;
+            break;
     }
     // 4. Determine the direction of velocity 
     //Determine whether robot motion (articulated or Cartesian) is in a positive or negative direction
-    if (request->index < 0 || request->index > 11)
-    {
-        response->ret = 0;
-        response->message = "Invalid jog index";
-        return false;
-    }   
     if(request->index & 1)
     {
         move_velocity = -move_velocity;
@@ -224,16 +490,23 @@ bool jog_callback(const shared_ptr<jaka_msgs::srv::Move::Request> request,
                     break;
                 default:
                     response->ret = jog_state;
-                    response->message = "error occurred:" + mapErr[jog_state];
+                    response->message = "error occurred:" + sdk_error_text(jog_state);
+                    jaka_driver::release_control(
+                        control_owner, jaka_driver::ControlOwner::kLegacyMotion);
                     break;
             }
         }
         else
         {
             response->ret = ret;
-            response->message = "error occurred:" + mapErr[ret];
+            response->message = "error occurred:" + sdk_error_text(ret);
+            jaka_driver::release_control(
+                control_owner, jaka_driver::ControlOwner::kLegacyMotion);
         }
-        jog_index_last = request->index;
+        if (response->ret == 1)
+        {
+            jog_index_last = request->index;
+        }
     }
     else
     {
@@ -248,6 +521,14 @@ bool jog_callback(const shared_ptr<jaka_msgs::srv::Move::Request> request,
 bool servo_move_enable_callback(const shared_ptr<jaka_msgs::srv::ServoMoveEnable::Request> request,
     shared_ptr<jaka_msgs::srv::ServoMoveEnable::Response> response)
 {
+    if (request->enable && !claim_legacy_control())
+    {
+        response->ret = 0;
+        response->message = std::string("Control is owned by ") +
+            jaka_driver::control_owner_name(control_owner.load());
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(session_mutex);
     BOOL enable = request->enable;
     int ret = robot.servo_move_enable(enable);
     switch(ret)
@@ -258,8 +539,18 @@ bool servo_move_enable_callback(const shared_ptr<jaka_msgs::srv::ServoMoveEnable
             break;
         default:
             response->ret = 0;
-            response->message = "error occurred:" + mapErr[ret];
+            response->message = "error occurred:" + sdk_error_text(ret);
+            if (request->enable)
+            {
+                jaka_driver::release_control(
+                    control_owner, jaka_driver::ControlOwner::kLegacyMotion);
+            }
             return false;
+    }
+    if (!request->enable)
+    {
+        jaka_driver::release_control(
+            control_owner, jaka_driver::ControlOwner::kLegacyMotion);
     }
     return true;
 }
@@ -273,6 +564,14 @@ bool servo_p_callback(const shared_ptr<jaka_msgs::srv::ServoMove::Request> reque
         response->message = "Six Cartesian pose values are required";
         return false;
     }
+    if (!claim_legacy_control())
+    {
+        response->ret = 0;
+        response->message = std::string("Control is owned by ") +
+            jaka_driver::control_owner_name(control_owner.load());
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(session_mutex);
     //speed * 0.008
     CartesianPose cartesian_pose;
     cartesian_pose.tran.x = request->pose[0];
@@ -290,7 +589,9 @@ bool servo_p_callback(const shared_ptr<jaka_msgs::srv::ServoMove::Request> reque
             break;
         default:
             response->ret = 0;
-            response->message = "error occurred:" + mapErr[ret];
+            response->message = "error occurred:" + sdk_error_text(ret);
+            jaka_driver::release_control(
+                control_owner, jaka_driver::ControlOwner::kLegacyMotion);
             return false;
     }
     return true;
@@ -305,6 +606,14 @@ bool servo_j_callback(const shared_ptr<jaka_msgs::srv::ServoMove::Request> reque
         response->message = "Six joint positions are required";
         return false;
     }
+    if (!claim_legacy_control())
+    {
+        response->ret = 0;
+        response->message = std::string("Control is owned by ") +
+            jaka_driver::control_owner_name(control_owner.load());
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(session_mutex);
     JointValue joint_pose;
     joint_pose.jVal[0] = request->pose[0];
     joint_pose.jVal[1] = request->pose[1];
@@ -321,7 +630,9 @@ bool servo_j_callback(const shared_ptr<jaka_msgs::srv::ServoMove::Request> reque
             break;
         default:
             response->ret = 0;
-            response->message = "error occurred:" + mapErr[ret];
+            response->message = "error occurred:" + sdk_error_text(ret);
+            jaka_driver::release_control(
+                control_owner, jaka_driver::ControlOwner::kLegacyMotion);
             return false;
     }
     return true;
@@ -336,7 +647,6 @@ void stop_move_callback(
     jog_count_temp.store(0);
     jog_index_last.store(-1);
 
-    std::lock_guard<std::mutex> lock(session_mutex);
     if (!sdk_logged_in.load())
     {
         RCLCPP_WARN(rclcpp::get_logger("stop_move_callback"), "SDK is not logged in");
@@ -345,7 +655,31 @@ void stop_move_callback(
         return;
     }
 
-    int ret = robot.motion_abort();
+    int ret = 0;
+    const auto owner = control_owner.load();
+    if (auto server = trajectory_server.lock();
+        owner == jaka_driver::ControlOwner::kTrajectory && server)
+    {
+        ret = server->request_stop();
+    }
+    else
+    {
+        std::lock_guard<std::mutex> sdk_lock(session_mutex);
+        const int abort_ret = robot.motion_abort();
+        if (owner == jaka_driver::ControlOwner::kCompliance)
+        {
+            const int disable_ret = robot.disable_force_control();
+            ret = abort_ret != 0 ? abort_ret : disable_ret;
+            jaka_driver::release_control(
+                control_owner, jaka_driver::ControlOwner::kCompliance);
+        }
+        else
+        {
+            ret = abort_ret;
+            jaka_driver::release_control(
+                control_owner, jaka_driver::ControlOwner::kLegacyMotion);
+        }
+    }
 
     switch(ret)
     {
@@ -355,9 +689,9 @@ void stop_move_callback(
             response->message = "stop_move has been executed";
             break;
         default:
-            RCLCPP_ERROR(rclcpp::get_logger("stop_move_callback"), "error occurred: %s", mapErr[ret].c_str());
+            RCLCPP_ERROR(rclcpp::get_logger("stop_move_callback"), "error occurred: %s", sdk_error_text(ret).c_str());
             response->success = false;
-            response->message = "error occurred: " + mapErr[ret];
+            response->message = "error occurred: " + sdk_error_text(ret);
             return;
     }
     return;
@@ -373,6 +707,7 @@ bool set_toolFrame_callback(const shared_ptr<jaka_msgs::srv::SetTcpFrame::Reques
         response->message = "Six Cartesian pose values are required";
         return false;
     }
+    std::lock_guard<std::mutex> lock(session_mutex);
     CartesianPose tool_frame;
     int tool_frame_id = request->tool_num;
     tool_frame.tran.x = request->pose[0];
@@ -396,7 +731,7 @@ bool set_toolFrame_callback(const shared_ptr<jaka_msgs::srv::SetTcpFrame::Reques
             break;
         default:
             response->ret = 0;
-            response->message = "error occurred:" + mapErr[ret];
+            response->message = "error occurred:" + sdk_error_text(ret);
             return false;
     }
     return true;
@@ -412,6 +747,7 @@ bool set_userFrame_callback(const shared_ptr<jaka_msgs::srv::SetUserFrame::Reque
         response->message = "Six Cartesian pose values are required";
         return false;
     }
+    std::lock_guard<std::mutex> lock(session_mutex);
     CartesianPose user_frame;
     int user_frame_id = request->user_num; 
     user_frame.tran.x = request->pose[0];
@@ -434,7 +770,7 @@ bool set_userFrame_callback(const shared_ptr<jaka_msgs::srv::SetUserFrame::Reque
             break;
         default:
             response->ret = 0;
-            response->message = "error occurred:" + mapErr[ret];
+            response->message = "error occurred:" + sdk_error_text(ret);
             return false;
     }
     return true;
@@ -443,6 +779,7 @@ bool set_userFrame_callback(const shared_ptr<jaka_msgs::srv::SetUserFrame::Reque
 bool set_payload_callback(const shared_ptr<jaka_msgs::srv::SetPayload::Request> request,
     shared_ptr<jaka_msgs::srv::SetPayload::Response> response)
 {
+    std::lock_guard<std::mutex> lock(session_mutex);
     PayLoad payload;
     int tool_id = request->tool_num;
 
@@ -462,7 +799,7 @@ bool set_payload_callback(const shared_ptr<jaka_msgs::srv::SetPayload::Request> 
             break;
         default:
             response->ret = 0;
-            response->message = "error occurred:" + mapErr[ret];
+            response->message = "error occurred:" + sdk_error_text(ret);
             return false;
     }
 
@@ -472,6 +809,23 @@ bool set_payload_callback(const shared_ptr<jaka_msgs::srv::SetPayload::Request> 
 bool drag_mode_callback(const shared_ptr<std_srvs::srv::SetBool::Request> request,
     shared_ptr<std_srvs::srv::SetBool::Response> response)
 {
+    if (request->data && !claim_legacy_control())
+    {
+        response->success = false;
+        response->message = std::string("Control is owned by ") +
+            jaka_driver::control_owner_name(control_owner.load());
+        return false;
+    }
+    if (!request->data &&
+        control_owner.load() != jaka_driver::ControlOwner::kIdle &&
+        control_owner.load() != jaka_driver::ControlOwner::kLegacyMotion)
+    {
+        response->success = false;
+        response->message = std::string("Control is owned by ") +
+            jaka_driver::control_owner_name(control_owner.load());
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(session_mutex);
     int ret = robot.drag_mode_enable(request->data);
     switch(ret)
     {
@@ -481,8 +835,19 @@ bool drag_mode_callback(const shared_ptr<std_srvs::srv::SetBool::Request> reques
             break;
         default:
             response->success = 0;
-            response->message = "error occurred:" + mapErr[ret];
+            response->message = "error occurred:" + sdk_error_text(ret);
+            if (request->data)
+            {
+                jaka_driver::release_control(
+                    control_owner, jaka_driver::ControlOwner::kLegacyMotion);
+            }
             return false;
+    }
+
+    if (!request->data)
+    {
+        jaka_driver::release_control(
+            control_owner, jaka_driver::ControlOwner::kLegacyMotion);
     }
 
     return true;
@@ -492,6 +857,7 @@ bool drag_mode_callback(const shared_ptr<std_srvs::srv::SetBool::Request> reques
 bool set_collisionLevel_callback(const shared_ptr<jaka_msgs::srv::SetCollision::Request> request,
     shared_ptr<jaka_msgs::srv::SetCollision::Response> response)
 {
+    std::lock_guard<std::mutex> lock(session_mutex);
     int collision_level;
     if(request->is_enable == 0)
     {
@@ -529,7 +895,7 @@ bool set_collisionLevel_callback(const shared_ptr<jaka_msgs::srv::SetCollision::
             break;
         default:
             response->ret = 0;
-            response->message = "error occurred:" + mapErr[ret];
+            response->message = "error occurred:" + sdk_error_text(ret);
             return false;
 
     }
@@ -539,7 +905,8 @@ bool set_collisionLevel_callback(const shared_ptr<jaka_msgs::srv::SetCollision::
 
 bool set_io_callback(const shared_ptr<jaka_msgs::srv::SetIO::Request> request,
     shared_ptr<jaka_msgs::srv::SetIO::Response> response)
-{   
+{
+    std::lock_guard<std::mutex> lock(session_mutex);
     IOType type;
     int ret;
     switch(request->type)
@@ -592,7 +959,7 @@ bool set_io_callback(const shared_ptr<jaka_msgs::srv::SetIO::Request> request,
             break;
         default:
             response->ret = 0;
-            response->message = "error occurred:" + mapErr[ret];
+            response->message = "error occurred:" + sdk_error_text(ret);
             return false;
     }
     return true;
@@ -602,7 +969,8 @@ bool set_io_callback(const shared_ptr<jaka_msgs::srv::SetIO::Request> request,
 
 bool get_io_callback(const shared_ptr<jaka_msgs::srv::GetIO::Request> request,
     shared_ptr<jaka_msgs::srv::GetIO::Response> response)
-{   
+{
+    std::lock_guard<std::mutex> lock(session_mutex);
     IOType type;
     int ret;
     BOOL digital_result;
@@ -650,7 +1018,7 @@ bool get_io_callback(const shared_ptr<jaka_msgs::srv::GetIO::Request> request,
                 break;
             default:
                 response->value = -999999;
-                response->message = "error occurred:" + mapErr[ret];
+                response->message = "error occurred:" + sdk_error_text(ret);
         }
         return true;
     }
@@ -678,7 +1046,7 @@ bool get_io_callback(const shared_ptr<jaka_msgs::srv::GetIO::Request> request,
                 break;
             default:
                 response->value = -999999;
-                response->message = "error occurred:" + mapErr[ret];
+                response->message = "error occurred:" + sdk_error_text(ret);
 
         }
     return true;
@@ -703,6 +1071,7 @@ bool get_fk_callback(const shared_ptr<jaka_msgs::srv::GetFK::Request> request,
         response->message = "Six joint values are required";
         return false;
     }
+    std::lock_guard<std::mutex> lock(session_mutex);
     JointValue joint_pose;
     CartesianPose cartesian_pose;
     for(int i = 0; i < 6; i++)
@@ -727,7 +1096,7 @@ bool get_fk_callback(const shared_ptr<jaka_msgs::srv::GetFK::Request> request,
             {
                 response->cartesian_pose.push_back(pose_init[i]);
             }
-            response->message = "error occurred:" + mapErr[ret];
+            response->message = "error occurred:" + sdk_error_text(ret);
             return false;
     }
     return true;
@@ -748,6 +1117,7 @@ bool get_ik_callback(const shared_ptr<jaka_msgs::srv::GetIK::Request> request,
         response->message = "Six Cartesian pose values are required";
         return false;
     }
+    std::lock_guard<std::mutex> lock(session_mutex);
     JointValue joint_pose;
     JointValue ref_joint;
     CartesianPose cartesian_pose;
@@ -778,7 +1148,7 @@ bool get_ik_callback(const shared_ptr<jaka_msgs::srv::GetIK::Request> request,
             {
                 response->joint.push_back(joint_init[i]);
             }
-            response->message = "error occurred:" + mapErr[ret];
+            response->message = "error occurred:" + sdk_error_text(ret);
             return false;
     }
     return true;
@@ -861,6 +1231,7 @@ void joint_position_callback(const rclcpp::Publisher<sensor_msgs::msg::JointStat
     }
     joint_position.header.stamp = rclcpp::Clock().now();
     joint_position_pub->publish(joint_position);
+    joint_state_pub->publish(joint_position);
 }
 
 void robot_states_callback(const rclcpp::Publisher<jaka_msgs::msg::RobotMsg>::SharedPtr& robot_states_pub)
@@ -952,7 +1323,10 @@ void stop_jog_callback()
     }
     if (jog_count >= 1 && jog_count_temp.load() == jog_count.load())
     {
+        std::lock_guard<std::mutex> lock(session_mutex);
         robot.jog_stop(-1);
+        jaka_driver::release_control(
+            control_owner, jaka_driver::ControlOwner::kLegacyMotion);
         jog_count.store(0);
         jog_count_temp.store(0);
         jog_index_last.store(-1);
@@ -975,6 +1349,13 @@ void login_callback(
         return;
     }
 
+    if (robot_ip.empty())
+    {
+        response->success = false;
+        response->message = "Robot IP was not configured";
+        return;
+    }
+
     int ret = robot.login_in(robot_ip.c_str(), false);
 
     if (ret == 0)
@@ -990,7 +1371,7 @@ void login_callback(
     else
     {
         response->success = false;
-        response->message = "error occurred:" + mapErr[ret];
+        response->message = "error occurred:" + sdk_error_text(ret);
     }
 }
 
@@ -1022,7 +1403,7 @@ void power_on_callback(
     else
     {
         response->success = false;
-        response->message = "error occurred:" + mapErr[ret];
+        response->message = "error occurred:" + sdk_error_text(ret);
     }
 }
 
@@ -1048,7 +1429,10 @@ void enable_robot_callback(
     if (ret == 0)
     {
         rclcpp::sleep_for(chrono::seconds(4));
-        robot.servo_speed_foresight(15, 0.03);
+        {
+            std::lock_guard<std::mutex> lock(session_mutex);
+            robot.servo_speed_foresight(15, 0.03);
+        }
 
         response->success = true;
         response->message = "enable_robot has been executed";
@@ -1056,7 +1440,7 @@ void enable_robot_callback(
     else
     {
         response->success = false;
-        response->message = "error occurred:" + mapErr[ret];
+        response->message = "error occurred:" + sdk_error_text(ret);
     }
 }
 
@@ -1076,6 +1460,7 @@ void disable_robot_callback(
     // Stop current motion before disabling.
     robot.motion_abort();
     robot.servo_move_enable(FALSE);
+    control_owner.store(jaka_driver::ControlOwner::kIdle);
 
     int ret = robot.disable_robot();
 
@@ -1087,7 +1472,7 @@ void disable_robot_callback(
     else
     {
         response->success = false;
-        response->message = "error occurred:" + mapErr[ret];
+        response->message = "error occurred:" + sdk_error_text(ret);
     }
 }
 
@@ -1095,6 +1480,13 @@ void power_off_callback(
     const std::shared_ptr<std_srvs::srv::Trigger::Request>,
     std::shared_ptr<std_srvs::srv::Trigger::Response> response)
 {
+    if (control_owner.load() != jaka_driver::ControlOwner::kIdle)
+    {
+        response->success = false;
+        response->message = std::string("Stop active control before power off; owner=") +
+            jaka_driver::control_owner_name(control_owner.load());
+        return;
+    }
     std::lock_guard<std::mutex> lock(session_mutex);
 
     if (!sdk_logged_in.load())
@@ -1114,7 +1506,7 @@ void power_off_callback(
     else
     {
         response->success = false;
-        response->message = "error occurred:" + mapErr[ret];
+        response->message = "error occurred:" + sdk_error_text(ret);
     }
 }
 
@@ -1122,6 +1514,13 @@ void logout_callback(
     const std::shared_ptr<std_srvs::srv::Trigger::Request>,
     std::shared_ptr<std_srvs::srv::Trigger::Response> response)
 {
+    if (control_owner.load() != jaka_driver::ControlOwner::kIdle)
+    {
+        response->success = false;
+        response->message = std::string("Stop active control before logout; owner=") +
+            jaka_driver::control_owner_name(control_owner.load());
+        return;
+    }
     if (!sdk_logged_in.load())
     {
         response->success = true;
@@ -1146,7 +1545,7 @@ void logout_callback(
     {
         sdk_logged_in.store(true);
         response->success = false;
-        response->message = "error occurred:" + mapErr[ret];
+        response->message = "error occurred:" + sdk_error_text(ret);
     }
 }
 
@@ -1177,6 +1576,7 @@ void get_conn_scoket_state(){
                 tool_position_callback(tool_position_pub);
                 joint_position_callback(joint_position_pub);
                 robot_states_callback(robot_state_pub);
+                wrench_callback(wrench_pub);
             
             }
         }
@@ -1184,7 +1584,7 @@ void get_conn_scoket_state(){
         if (ret)
         {
             RCLCPP_ERROR(rclcpp::get_logger("get_conn_socket_state"), 
-                         "Connection error or get_joint_position failed, error_code: %d, error: %s", ret, mapErr[ret].c_str());
+                         "Connection error or get_joint_position failed, error_code: %d, error: %s", ret, sdk_error_text(ret).c_str());
         }
 
         rclcpp::sleep_for(chrono::milliseconds(100)); 
@@ -1198,8 +1598,16 @@ int main(int argc, char *argv[])
     rclcpp::init(argc, argv);
     auto node = rclcpp::Node::make_shared("jaka_driver");
     rclcpp::Rate rate(125); 
-    string default_ip = "10.5.5.100";
+    string default_ip;
     robot_ip = node->declare_parameter<std::string>("ip", default_ip);
+    ft_frame_id = node->declare_parameter<std::string>("ft_frame_id", "Link_06");
+    ft_data_type = node->declare_parameter<int>("ft_data_type", 3);
+    if (ft_data_type < 0 || ft_data_type > 3)
+    {
+        RCLCPP_FATAL(node->get_logger(), "ft_data_type 必须在 [0, 3] 范围内");
+        rclcpp::shutdown();
+        return 2;
+    }
 
     // Blocking motion commands run in this group.
     auto sdk_callback_group = node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -1244,8 +1652,11 @@ int main(int argc, char *argv[])
     tool_position_pub = node->create_publisher<geometry_msgs::msg::TwistStamped>("/jaka_driver/tool_position", 10);
     // //3.2 Joint status information reporting
     joint_position_pub = node->create_publisher<sensor_msgs::msg::JointState>("/jaka_driver/joint_position", 10);
+    // 标准话题供 robot_state_publisher、MoveIt 和项目适配层复用。
+    joint_state_pub = node->create_publisher<sensor_msgs::msg::JointState>("/joint_states", 10);
     // //3.3 Report robot event status information
     robot_state_pub = node->create_publisher<jaka_msgs::msg::RobotMsg>("/jaka_driver/robot_states", 10);
+    wrench_pub = node->create_publisher<geometry_msgs::msg::WrenchStamped>("/jaka_driver/wrench", 10);
     
     // Automatically stop robot jog and motion
     auto stop_jog = node->create_wall_timer(chrono::seconds(3), stop_jog_callback, sdk_callback_group);
@@ -1257,6 +1668,20 @@ int main(int argc, char *argv[])
     auto disable_robot_service = node->create_service<std_srvs::srv::Trigger>("/jaka_driver/disable_robot", &disable_robot_callback, rmw_qos_profile_services_default, interrupt_callback_group);
     auto power_off_service = node->create_service<std_srvs::srv::Trigger>("/jaka_driver/power_off", &power_off_callback, rmw_qos_profile_services_default, sdk_callback_group);
     auto logout_service = node->create_service<std_srvs::srv::Trigger>("/jaka_driver/logout", &logout_callback, rmw_qos_profile_services_default, sdk_callback_group);
+    auto ft_limit_service = node->create_service<jaka_msgs::srv::SetTorqueSensorSoftLimit>("/jaka_driver/set_ft_soft_limit", &set_torque_sensor_soft_limit_callback, rmw_qos_profile_services_default, sdk_callback_group);
+    auto admittance_config_service = node->create_service<jaka_msgs::srv::SetAdmittanceConfig>("/jaka_driver/set_admittance_config", &set_admittance_config_callback, rmw_qos_profile_services_default, sdk_callback_group);
+    auto admittance_enable_service = node->create_service<std_srvs::srv::SetBool>("/jaka_driver/enable_admittance", &enable_admittance_callback, rmw_qos_profile_services_default, interrupt_callback_group);
+    auto zero_ft_service = node->create_service<std_srvs::srv::Trigger>("/jaka_driver/zero_ft_sensor", &zero_ft_sensor_callback, rmw_qos_profile_services_default, sdk_callback_group);
+
+    auto trajectory_action_server =
+        std::make_shared<jaka_driver::FollowJointTrajectoryServer>(
+            node,
+            robot,
+            sdk_logged_in,
+            control_owner,
+            session_mutex,
+            "/jaka_s5_controller/follow_joint_trajectory");
+    trajectory_server = trajectory_action_server;
 
     // Monitor network connection status
     thread conn_state_thread(get_conn_scoket_state);
@@ -1271,11 +1696,22 @@ int main(int argc, char *argv[])
     executor.add_node(node);
     executor.spin();
 
-    rclcpp::shutdown();
-
-     // Ensure thread is joined before shutting down the node
+    // 先结束 SDK 状态线程，再释放 Action 和全局 ROS 实体。旧顺序在
+    // context 已关闭后仍析构 publisher，Fast DDS 可能因此崩溃。
     if (conn_state_thread.joinable()) {
         conn_state_thread.join();
+    }
+
+    trajectory_action_server.reset();
+    trajectory_server.reset();
+    wrench_pub.reset();
+    robot_state_pub.reset();
+    joint_state_pub.reset();
+    joint_position_pub.reset();
+    tool_position_pub.reset();
+
+    if (rclcpp::ok()) {
+        rclcpp::shutdown();
     }
 
     return 0;

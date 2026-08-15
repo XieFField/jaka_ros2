@@ -12,6 +12,7 @@ set(CMAKE_CXX_STANDARD 17)
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_action REQUIRED)
 find_package(rclpy REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
@@ -19,6 +20,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(jaka_msgs REQUIRED)
 find_package(action_msgs REQUIRED)
 find_package(control_msgs REQUIRED)
+find_package(trajectory_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 
 # Optionally find additional dependencies
@@ -28,7 +30,11 @@ find_package(std_srvs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 # Declare executable targets
-add_executable(jaka_driver src/jaka_driver.cpp)
+add_executable(jaka_driver
+  src/jaka_driver.cpp
+  src/follow_joint_trajectory_server.cpp
+  src/trajectory_utils.cpp
+)
 add_executable(sdk_test src/sdk_test.cpp)
 add_executable(client src/client.cpp)
 add_executable(servoj_demo src/servoj_demo.cpp)
@@ -36,6 +42,7 @@ add_executable(servoj_demo src/servoj_demo.cpp)
 # Link libraries
 ament_target_dependencies(jaka_driver
   rclcpp
+  rclcpp_action
   std_msgs
   std_srvs
   geometry_msgs
@@ -43,6 +50,7 @@ ament_target_dependencies(jaka_driver
   jaka_msgs
   action_msgs
   control_msgs
+  trajectory_msgs
 )
 ament_target_dependencies(sdk_test
   rclcpp
@@ -126,5 +134,17 @@ install(TARGETS
 install(DIRECTORY launch/
   DESTINATION share/${PROJECT_NAME}/launch
 )
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(trajectory_utils_test
+    test/trajectory_utils_test.cpp
+    src/trajectory_utils.cpp
+  )
+  if(TARGET trajectory_utils_test)
+    target_include_directories(trajectory_utils_test PUBLIC include)
+    ament_target_dependencies(trajectory_utils_test trajectory_msgs)
+  endif()
+endif()
 
 ament_package()

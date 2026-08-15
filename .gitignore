@@ -1,0 +1,15 @@
+# colcon build products
+/build/
+/install/
+/log/
+/src/build/
+/src/install/
+/src/log/
+
+# Python and launch caches
+__pycache__/
+*.py[cod]
+
+# Local editor state
+**/.vscode/
+**/.idea/

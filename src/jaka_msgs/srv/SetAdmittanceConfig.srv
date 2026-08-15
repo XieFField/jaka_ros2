@@ -1,0 +1,11 @@
+# Axis: 0..5 maps to X, Y, Z, RX, RY, RZ.
+int32 axis
+int32 option
+float64 target_wrench
+float64 constant
+int32 normal_track
+float64 rebound
+---
+bool success
+int32 error_code
+string message
