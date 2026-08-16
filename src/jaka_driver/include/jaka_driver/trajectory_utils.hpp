@@ -28,6 +28,13 @@ std::optional<unsigned int> interpolation_steps(
     double current_time,
     double servo_period);
 
+// 限制单次 servo_j 调用覆盖的插补周期数，避免异常长的单段命令阻塞 SDK。
+bool validate_servo_segments(
+    const trajectory_msgs::msg::JointTrajectory & trajectory,
+    double servo_period,
+    unsigned int maximum_servo_steps,
+    std::string & error);
+
 }  // namespace jaka_driver
 
 #endif  // JAKA_DRIVER__TRAJECTORY_UTILS_HPP_

@@ -36,6 +36,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/GetIK.srv"
   "srv/SetTorqueSensorSoftLimit.srv"
   "srv/SetAdmittanceConfig.srv"
+  "srv/SetForceControlFrame.srv"
+  "srv/GetAdmittanceState.srv"
    DEPENDENCIES std_msgs std_srvs
 )
 

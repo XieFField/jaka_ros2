@@ -1,0 +1,15 @@
+---
+bool success
+int32 error_code
+string message
+bool force_control_enabled
+int32 force_control_frame
+int32 sensor_compensation
+int32 compliance_type
+string control_owner
+float64[6] soft_limits
+int32[6] axis_options
+float64[6] maximum_speed_wrench
+float64[6] constant_wrench
+int32[6] normal_track
+float64[6] rebound_wrench

@@ -26,6 +26,8 @@
 #include "jaka_msgs/srv/get_ik.hpp"
 #include "jaka_msgs/srv/clear_error.hpp"
 #include "jaka_msgs/srv/set_admittance_config.hpp"
+#include "jaka_msgs/srv/get_admittance_state.hpp"
+#include "jaka_msgs/srv/set_force_control_frame.hpp"
 #include "jaka_msgs/srv/set_torque_sensor_soft_limit.hpp"
 
 #include "jaka_driver/JAKAZuRobot.h"
@@ -196,9 +198,12 @@ void set_admittance_config_callback(
 {
     if (request->axis < 0 || request->axis >= 6 ||
         (request->option != 0 && request->option != 1) ||
-        !std::isfinite(request->target_wrench) ||
-        !std::isfinite(request->constant) ||
-        !std::isfinite(request->rebound))
+        !std::isfinite(request->maximum_speed_wrench) ||
+        !std::isfinite(request->constant_wrench) ||
+        !std::isfinite(request->rebound_wrench) ||
+        request->maximum_speed_wrench < 0.0 ||
+        request->rebound_wrench < 0.0 ||
+        (request->option == 1 && request->maximum_speed_wrench <= 0.0))
     {
         response->success = false;
         response->error_code = -2;
@@ -217,15 +222,114 @@ void set_admittance_config_callback(
     const int ret = robot.set_admit_ctrl_config(
         request->axis,
         request->option,
-        request->target_wrench,
-        request->constant,
+        request->maximum_speed_wrench,
+        request->constant_wrench,
         request->normal_track,
-        request->rebound);
+        request->rebound_wrench);
     response->success = ret == 0;
     response->error_code = ret;
     response->message = ret == 0 ?
         "Admittance axis configured" :
         "set_admit_ctrl_config failed: " + std::to_string(ret);
+}
+
+void set_force_control_frame_callback(
+    const std::shared_ptr<jaka_msgs::srv::SetForceControlFrame::Request> request,
+    std::shared_ptr<jaka_msgs::srv::SetForceControlFrame::Response> response)
+{
+    if (request->frame != static_cast<int>(FTFrame_Tool) &&
+        request->frame != static_cast<int>(FTFrame_World))
+    {
+        response->success = false;
+        response->error_code = -2;
+        response->message = "Force-control frame must be 0 (tool) or 1 (world)";
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(session_mutex);
+    if (!sdk_logged_in.load())
+    {
+        response->success = false;
+        response->error_code = -1;
+        response->message = "SDK is not logged in";
+        return;
+    }
+    const int ret = robot.set_ft_ctrl_frame(
+        static_cast<FTFrameType>(request->frame));
+    response->success = ret == 0;
+    response->error_code = ret;
+    response->message = ret == 0 ?
+        "Force-control frame configured" :
+        "set_ft_ctrl_frame failed: " + std::to_string(ret);
+}
+
+void get_admittance_state_callback(
+    const std::shared_ptr<jaka_msgs::srv::GetAdmittanceState::Request>,
+    std::shared_ptr<jaka_msgs::srv::GetAdmittanceState::Response> response)
+{
+    std::lock_guard<std::mutex> lock(session_mutex);
+    if (!sdk_logged_in.load())
+    {
+        response->success = false;
+        response->error_code = -1;
+        response->message = "SDK is not logged in";
+        return;
+    }
+
+    FTxyz soft_limits{};
+    FTFrameType control_frame = FTFrame_Tool;
+    BOOL control_enabled = 0;
+    int sensor_compensation = 0;
+    int compliance_type = 0;
+    RobotAdmitCtrl configurations{};
+    int ret = robot.get_torque_sensor_soft_limit(&soft_limits);
+    if (ret == 0)
+    {
+        ret = robot.get_admit_ctrl_config(&configurations);
+    }
+    if (ret == 0)
+    {
+        ret = robot.get_ft_ctrl_mode(&control_enabled);
+    }
+    if (ret == 0)
+    {
+        ret = robot.get_ft_ctrl_frame(&control_frame);
+    }
+    if (ret == 0)
+    {
+        ret = robot.get_compliant_type(
+            &sensor_compensation, &compliance_type);
+    }
+    if (ret != 0)
+    {
+        response->success = false;
+        response->error_code = ret;
+        response->message = "Reading JAKA admittance state failed: " +
+            std::to_string(ret);
+        return;
+    }
+
+    response->soft_limits = {
+        soft_limits.fx, soft_limits.fy, soft_limits.fz,
+        soft_limits.tx, soft_limits.ty, soft_limits.tz};
+    for (std::size_t axis = 0; axis < 6U; ++axis)
+    {
+        const auto & config = configurations.admit_ctrl[axis];
+        response->axis_options[axis] = config.opt;
+        response->maximum_speed_wrench[axis] = config.ft_user;
+        response->constant_wrench[axis] = config.ft_constant;
+        response->normal_track[axis] = config.ft_normal_track;
+        response->rebound_wrench[axis] = config.ft_rebound;
+    }
+    response->force_control_enabled = control_enabled != 0;
+    response->force_control_frame = static_cast<int>(control_frame);
+    response->sensor_compensation = sensor_compensation;
+    response->compliance_type = compliance_type;
+    response->control_owner = jaka_driver::control_owner_name(
+        control_owner.load());
+    response->success = true;
+    response->error_code = 0;
+    response->message = "JAKA admittance state read successfully";
 }
 
 void enable_admittance_callback(
@@ -1670,6 +1774,8 @@ int main(int argc, char *argv[])
     auto logout_service = node->create_service<std_srvs::srv::Trigger>("/jaka_driver/logout", &logout_callback, rmw_qos_profile_services_default, sdk_callback_group);
     auto ft_limit_service = node->create_service<jaka_msgs::srv::SetTorqueSensorSoftLimit>("/jaka_driver/set_ft_soft_limit", &set_torque_sensor_soft_limit_callback, rmw_qos_profile_services_default, sdk_callback_group);
     auto admittance_config_service = node->create_service<jaka_msgs::srv::SetAdmittanceConfig>("/jaka_driver/set_admittance_config", &set_admittance_config_callback, rmw_qos_profile_services_default, sdk_callback_group);
+    auto force_control_frame_service = node->create_service<jaka_msgs::srv::SetForceControlFrame>("/jaka_driver/set_force_control_frame", &set_force_control_frame_callback, rmw_qos_profile_services_default, sdk_callback_group);
+    auto admittance_state_service = node->create_service<jaka_msgs::srv::GetAdmittanceState>("/jaka_driver/get_admittance_state", &get_admittance_state_callback, rmw_qos_profile_services_default, sdk_callback_group);
     auto admittance_enable_service = node->create_service<std_srvs::srv::SetBool>("/jaka_driver/enable_admittance", &enable_admittance_callback, rmw_qos_profile_services_default, interrupt_callback_group);
     auto zero_ft_service = node->create_service<std_srvs::srv::Trigger>("/jaka_driver/zero_ft_sensor", &zero_ft_sensor_callback, rmw_qos_profile_services_default, sdk_callback_group);
 

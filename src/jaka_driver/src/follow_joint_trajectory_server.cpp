@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <stdexcept>
@@ -47,14 +48,20 @@ FollowJointTrajectoryServer::FollowJointTrajectoryServer(
         "trajectory_goal_timeout", goal_timeout_);
     servo_period_ = node_->declare_parameter<double>(
         "trajectory_servo_period", servo_period_);
+    const auto maximum_servo_steps = node_->declare_parameter<int64_t>(
+        "maximum_servo_steps", static_cast<int64_t>(maximum_servo_steps_));
     maximum_trajectory_duration_ = node_->declare_parameter<double>(
         "maximum_trajectory_duration", maximum_trajectory_duration_);
 
     if (!(goal_tolerance_ > 0.0) || !(goal_timeout_ > 0.0) ||
-        !(servo_period_ > 0.0) || !(maximum_trajectory_duration_ > 0.0))
+        !(servo_period_ > 0.0) || !(maximum_trajectory_duration_ > 0.0) ||
+        maximum_servo_steps <= 0 ||
+        maximum_servo_steps >
+        static_cast<int64_t>(std::numeric_limits<unsigned int>::max()))
     {
         throw std::invalid_argument("轨迹 Action 的容差和周期参数必须大于零");
     }
+    maximum_servo_steps_ = static_cast<unsigned int>(maximum_servo_steps);
 
     server_ = rclcpp_action::create_server<Action>(
         node_,
@@ -141,14 +148,10 @@ rclcpp_action::CancelResponse FollowJointTrajectoryServer::handle_cancel(
         return rclcpp_action::CancelResponse::REJECT;
     }
 
-    const int ret = request_stop();
-    if (ret != 0)
-    {
-        RCLCPP_ERROR(
-            node_->get_logger(),
-            "取消轨迹时停止机器人失败: %s",
-            sdk_error(ret).c_str());
-    }
+    // 此处仅接受取消请求。回调返回后 ROS Action 才会把 Goal 转换为
+    // CANCELING，执行线程检测到 is_canceling() 后再停止 SDK 并设置 CANCELED。
+    // 若在回调返回前抢先调用 canceled()，rclcpp_action 会因状态转换非法而终止进程。
+    RCLCPP_INFO(node_->get_logger(), "接受轨迹 Action 取消请求");
     return rclcpp_action::CancelResponse::ACCEPT;
 }
 
@@ -168,11 +171,16 @@ bool FollowJointTrajectoryServer::validate_goal(
     const Action::Goal & goal,
     std::string & error) const
 {
-    return validate_trajectory(
+    if (!validate_trajectory(
         goal.trajectory,
         expected_joint_names_,
         maximum_trajectory_duration_,
-        error);
+        error))
+    {
+        return false;
+    }
+    return validate_servo_segments(
+        goal.trajectory, servo_period_, maximum_servo_steps_, error);
 }
 
 bool FollowJointTrajectoryServer::robot_ready(std::string & error)
@@ -304,74 +312,77 @@ void FollowJointTrajectoryServer::execute(
 
     const auto & trajectory = goal_handle->get_goal()->trajectory;
     const auto started_at = std::chrono::steady_clock::now();
+    const double trajectory_duration = duration_seconds(
+        trajectory.points.back().time_from_start);
     double previous_time = 0.0;
 
-    for (const auto & point : trajectory.points)
+    RCLCPP_INFO(
+        node_->get_logger(),
+        "开始流式下发 JAKA servo_j 轨迹: points=%zu, duration=%.3f s",
+        trajectory.points.size(), trajectory_duration);
+
+    // servo_j 是流式接口：每条命令只描述下一个插补段，后续命令必须连续下发。
+    // 整段下发期间独占 SDK 会话，避免状态读取插入相邻命令之间形成控制间隙。
     {
-        const double point_time = duration_seconds(point.time_from_start);
-        const auto step_num = interpolation_steps(
-            previous_time, point_time, servo_period_);
-        if (!step_num)
+        std::unique_lock<std::mutex> lock(session_mutex_);
+        for (std::size_t point_index = 0;
+            point_index < trajectory.points.size(); ++point_index)
         {
-            abort_goal(
-                Action::Result::INVALID_GOAL,
-                "轨迹插补周期无效");
-            return;
-        }
+            if (goal_handle->is_canceling())
+            {
+                lock.unlock();
+                cancel_goal("轨迹下发期间已取消并停止机器人");
+                return;
+            }
+            if (shutting_down_.load() || cancel_requested_.load() ||
+                !rclcpp::ok())
+            {
+                lock.unlock();
+                abort_goal(
+                    Action::Result::PATH_TOLERANCE_VIOLATED,
+                    "轨迹下发期间被外部停止");
+                return;
+            }
 
-        const auto positions = reordered_positions(
-            trajectory.joint_names, point.positions);
-        JointValue target{};
-        for (std::size_t index = 0; index < positions.size(); ++index)
-        {
-            target.jVal[index] = positions[index];
-        }
+            const auto & point = trajectory.points[point_index];
+            const double point_time = duration_seconds(point.time_from_start);
+            const auto step_num = interpolation_steps(
+                previous_time, point_time, servo_period_);
+            if (!step_num)
+            {
+                lock.unlock();
+                abort_goal(
+                    Action::Result::INVALID_GOAL,
+                    "轨迹插补周期无效");
+                return;
+            }
 
-        int servo_ret;
-        {
-            std::lock_guard<std::mutex> lock(session_mutex_);
-            servo_ret = robot_.servo_j(&target, MoveMode::ABS, *step_num);
-        }
-        if (servo_ret != 0)
-        {
-            abort_goal(
-                Action::Result::PATH_TOLERANCE_VIOLATED,
-                "servo_j 执行失败: " + sdk_error(servo_ret));
-            return;
-        }
+            const auto positions = reordered_positions(
+                trajectory.joint_names, point.positions);
+            JointValue target{};
+            for (std::size_t index = 0; index < positions.size(); ++index)
+            {
+                target.jVal[index] = positions[index];
+            }
 
-        // 在该段起点下发终点和插补周期，然后等待段终点读取反馈。
-        const auto point_deadline = started_at +
-            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                std::chrono::duration<double>(point_time));
-        if (!wait_until(
-                point_deadline,
-                goal_handle))
-        {
-            cancel_goal("轨迹已取消并停止机器人");
-            return;
-        }
+            const int servo_ret = robot_.servo_j(
+                &target, MoveMode::ABS, *step_num);
+            if (servo_ret != 0)
+            {
+                lock.unlock();
+                abort_goal(
+                    Action::Result::PATH_TOLERANCE_VIOLATED,
+                    "servo_j 执行失败: " + sdk_error(servo_ret));
+                return;
+            }
 
-        JointValue actual{};
-        int state_ret;
-        {
-            std::lock_guard<std::mutex> lock(session_mutex_);
-            state_ret = robot_.get_joint_position(&actual);
+            RCLCPP_DEBUG(
+                node_->get_logger(),
+                "servo_j point=%zu/%zu, time=%.6f s, step_num=%u",
+                point_index + 1, trajectory.points.size(), point_time,
+                *step_num);
+            previous_time = point_time;
         }
-        if (state_ret != 0)
-        {
-            abort_goal(
-                Action::Result::PATH_TOLERANCE_VIOLATED,
-                "读取关节反馈失败: " + sdk_error(state_ret));
-            return;
-        }
-
-        publish_feedback(
-            goal_handle,
-            point,
-            actual,
-            std::chrono::steady_clock::now() - started_at);
-        previous_time = point_time;
     }
 
     double allowed_timeout = goal_timeout_;
@@ -381,16 +392,32 @@ void FollowJointTrajectoryServer::execute(
     {
         allowed_timeout = requested_timeout;
     }
-    const auto deadline = std::chrono::steady_clock::now() +
-        std::chrono::duration<double>(allowed_timeout);
+    // 流式命令会很快完成下发，但机器人仍需 trajectory_duration 才能走完。
+    // 终点超时因此必须从计划终止时刻计算，不能从下发结束时刻直接起算。
+    const auto expected_finish = started_at +
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(trajectory_duration));
+    const auto deadline = expected_finish +
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(allowed_timeout));
     const auto final_positions = reordered_positions(
         trajectory.joint_names, trajectory.points.back().positions);
+    double last_maximum_error = std::numeric_limits<double>::infinity();
+    std::size_t last_maximum_error_joint = 0;
 
     while (std::chrono::steady_clock::now() < deadline)
     {
-        if (cancel_requested_.load() || goal_handle->is_canceling())
+        if (goal_handle->is_canceling())
         {
             cancel_goal("终点检查期间轨迹被取消");
+            return;
+        }
+        if (shutting_down_.load() || cancel_requested_.load() ||
+            !rclcpp::ok())
+        {
+            abort_goal(
+                Action::Result::PATH_TOLERANCE_VIOLATED,
+                "轨迹执行期间被外部停止");
             return;
         }
 
@@ -409,13 +436,29 @@ void FollowJointTrajectoryServer::execute(
         }
 
         double maximum_error = 0.0;
+        std::size_t maximum_error_joint = 0;
         for (std::size_t index = 0; index < final_positions.size(); ++index)
         {
-            maximum_error = std::max(
-                maximum_error,
-                std::abs(final_positions[index] - actual.jVal[index]));
+            const double error = std::abs(
+                final_positions[index] - actual.jVal[index]);
+            if (error > maximum_error)
+            {
+                maximum_error = error;
+                maximum_error_joint = index;
+            }
         }
-        if (maximum_error <= goal_tolerance_)
+        last_maximum_error = maximum_error;
+        last_maximum_error_joint = maximum_error_joint;
+
+        publish_feedback(
+            goal_handle,
+            trajectory.points.back(),
+            actual,
+            std::chrono::steady_clock::now() - started_at);
+        // 即使提前进入终点容差，也必须等到轨迹计划终止时刻再结束 servo mode，
+        // 否则小幅运动会在执行到一半时被提前停止。
+        if (std::chrono::steady_clock::now() >= expected_finish &&
+            maximum_error <= goal_tolerance_)
         {
             const int stop_ret = stop_motion_and_servo();
             if (stop_ret != 0)
@@ -439,7 +482,10 @@ void FollowJointTrajectoryServer::execute(
 
     abort_goal(
         Action::Result::GOAL_TOLERANCE_VIOLATED,
-        "最终关节误差在超时前未进入容差");
+        "最终关节误差在超时前未进入容差: " +
+        expected_joint_names_[last_maximum_error_joint] + " error=" +
+        std::to_string(last_maximum_error) + " rad, tolerance=" +
+        std::to_string(goal_tolerance_) + " rad");
 }
 
 }  // namespace jaka_driver

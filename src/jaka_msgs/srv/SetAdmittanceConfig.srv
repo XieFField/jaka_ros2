@@ -1,10 +1,13 @@
 # Axis: 0..5 maps to X, Y, Z, RX, RY, RZ.
 int32 axis
 int32 option
-float64 target_wrench
-float64 constant
+# External wrench that produces the maximum admittance speed (SDK ftUser).
+float64 maximum_speed_wrench
+# Constant-force target applied by the controller (SDK ftConstant).
+float64 constant_wrench
 int32 normal_track
-float64 rebound
+# Wrench scale used to return toward the initial pose (SDK ftReboundFK).
+float64 rebound_wrench
 ---
 bool success
 int32 error_code

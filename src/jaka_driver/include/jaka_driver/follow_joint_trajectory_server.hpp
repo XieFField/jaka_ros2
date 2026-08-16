@@ -78,6 +78,7 @@ private:
     double goal_tolerance_{0.01};
     double goal_timeout_{2.0};
     double servo_period_{0.008};
+    unsigned int maximum_servo_steps_{50};
     double maximum_trajectory_duration_{300.0};
 
     mutable std::mutex worker_mutex_;

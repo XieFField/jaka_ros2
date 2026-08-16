@@ -50,7 +50,9 @@ TEST(TrajectoryUtilsTest, RejectsWrongJointAndNonFiniteValue)
 TEST(TrajectoryUtilsTest, RejectsNonMonotonicAndExcessiveDuration)
 {
     auto trajectory = valid_trajectory();
-    trajectory.points.push_back(trajectory.points.front());
+    auto decreasing_point = trajectory.points.front();
+    decreasing_point.time_from_start.sec = 0;
+    trajectory.points.push_back(decreasing_point);
     std::string error;
     EXPECT_FALSE(jaka_driver::validate_trajectory(
         trajectory, kExpectedJoints, 60.0, error));
@@ -58,6 +60,30 @@ TEST(TrajectoryUtilsTest, RejectsNonMonotonicAndExcessiveDuration)
     trajectory = valid_trajectory();
     EXPECT_FALSE(jaka_driver::validate_trajectory(
         trajectory, kExpectedJoints, 0.5, error));
+}
+
+TEST(TrajectoryUtilsTest, AcceptsSameTimeForUnchangedStopPosition)
+{
+    auto trajectory = valid_trajectory();
+    auto stop_point = trajectory.points.front();
+    stop_point.velocities.assign(kExpectedJoints.size(), 0.0);
+    trajectory.points.push_back(stop_point);
+
+    std::string error;
+    EXPECT_TRUE(jaka_driver::validate_trajectory(
+        trajectory, kExpectedJoints, 60.0, error));
+}
+
+TEST(TrajectoryUtilsTest, RejectsSameTimeForDifferentPosition)
+{
+    auto trajectory = valid_trajectory();
+    auto conflicting_point = trajectory.points.front();
+    conflicting_point.positions.front() += 0.01;
+    trajectory.points.push_back(conflicting_point);
+
+    std::string error;
+    EXPECT_FALSE(jaka_driver::validate_trajectory(
+        trajectory, kExpectedJoints, 60.0, error));
 }
 
 TEST(TrajectoryUtilsTest, ReordersJointValues)
@@ -78,6 +104,19 @@ TEST(TrajectoryUtilsTest, ComputesInterpolationSteps)
     EXPECT_EQ(*steps, 10U);
     EXPECT_EQ(*jaka_driver::interpolation_steps(0.0, 0.0, 0.008), 1U);
     EXPECT_FALSE(jaka_driver::interpolation_steps(1.0, 0.5, 0.008));
+}
+
+TEST(TrajectoryUtilsTest, RejectsServoSegmentAboveConfiguredStepLimit)
+{
+    auto trajectory = valid_trajectory();
+    std::string error;
+    EXPECT_FALSE(jaka_driver::validate_servo_segments(
+        trajectory, 0.008, 50U, error));
+
+    trajectory.points.front().time_from_start.sec = 0;
+    trajectory.points.front().time_from_start.nanosec = 100000000;
+    EXPECT_TRUE(jaka_driver::validate_servo_segments(
+        trajectory, 0.008, 50U, error));
 }
 
 }  // namespace

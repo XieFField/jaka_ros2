@@ -24,6 +24,14 @@ bool finite_values(const std::vector<double> & values)
         [](double value) {return std::isfinite(value);});
 }
 
+bool same_positions(
+    const std::vector<double> & lhs,
+    const std::vector<double> & rhs)
+{
+    return lhs.size() == rhs.size() &&
+        std::equal(lhs.begin(), lhs.end(), rhs.begin());
+}
+
 }  // namespace
 
 bool validate_trajectory(
@@ -63,6 +71,7 @@ bool validate_trajectory(
     }
 
     double previous_time = -1.0;
+    std::vector<double> previous_positions;
     for (const auto & point : trajectory.points)
     {
         if (point.positions.size() != trajectory.joint_names.size() ||
@@ -83,9 +92,15 @@ bool validate_trajectory(
 
         const double current_time = duration_seconds(point.time_from_start);
         if (!std::isfinite(current_time) || current_time < 0.0 ||
-            current_time <= previous_time)
+            current_time < previous_time)
         {
-            error = "time_from_start 必须非负且严格递增";
+            error = "time_from_start 必须非负且不能倒退";
+            return false;
+        }
+        if (current_time == previous_time &&
+            !same_positions(point.positions, previous_positions))
+        {
+            error = "相同 time_from_start 不能对应不同关节位置";
             return false;
         }
         if (current_time > maximum_duration)
@@ -94,6 +109,7 @@ bool validate_trajectory(
             return false;
         }
         previous_time = current_time;
+        previous_positions = point.positions;
     }
     return true;
 }
@@ -141,6 +157,42 @@ std::optional<unsigned int> interpolation_steps(
         return std::nullopt;
     }
     return static_cast<unsigned int>(rounded);
+}
+
+bool validate_servo_segments(
+    const trajectory_msgs::msg::JointTrajectory & trajectory,
+    double servo_period,
+    unsigned int maximum_servo_steps,
+    std::string & error)
+{
+    if (!std::isfinite(servo_period) || servo_period <= 0.0 ||
+        maximum_servo_steps == 0U)
+    {
+        error = "servo 插补周期或单段步数上限配置无效";
+        return false;
+    }
+
+    double previous_time = 0.0;
+    for (const auto & point : trajectory.points)
+    {
+        const double current_time = duration_seconds(point.time_from_start);
+        const auto steps = interpolation_steps(
+            previous_time, current_time, servo_period);
+        if (!steps)
+        {
+            error = "轨迹包含无法转换为 servo 周期的时间段";
+            return false;
+        }
+        if (*steps > maximum_servo_steps)
+        {
+            error = "轨迹单段插补周期数超过驱动上限: steps=" +
+                std::to_string(*steps) + ", maximum=" +
+                std::to_string(maximum_servo_steps);
+            return false;
+        }
+        previous_time = current_time;
+    }
+    return true;
 }
 
 }  // namespace jaka_driver
