@@ -1,0 +1,14 @@
+---
+bool success
+int32 error_code
+string message
+bool enabled
+# SDK 对奇异点、速度或关节限位的告警状态。
+int32 warning_state
+int32 frame
+string control_owner
+int32 sensitivity_level
+int32 warning_range
+int32[6] axis_options
+float64[6] rebound
+float64[6] rigidity

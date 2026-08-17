@@ -145,6 +145,13 @@ if(BUILD_TESTING)
     target_include_directories(trajectory_utils_test PUBLIC include)
     ament_target_dependencies(trajectory_utils_test trajectory_msgs)
   endif()
+
+  ament_add_gtest(control_ownership_test
+    test/control_ownership_test.cpp
+  )
+  if(TARGET control_ownership_test)
+    target_include_directories(control_ownership_test PUBLIC include)
+  endif()
 endif()
 
 ament_package()

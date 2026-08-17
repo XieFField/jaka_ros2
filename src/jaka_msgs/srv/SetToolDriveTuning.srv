@@ -1,0 +1,8 @@
+# Fusion-drive sensitivity: 0 disables it; 1..5 select increasing levels.
+int32 sensitivity_level
+# Motion-limit warning range accepted by the SDK: 1..5.
+int32 warning_range
+---
+bool success
+int32 error_code
+string message

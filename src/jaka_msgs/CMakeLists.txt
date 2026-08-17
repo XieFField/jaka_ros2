@@ -38,6 +38,10 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/SetAdmittanceConfig.srv"
   "srv/SetForceControlFrame.srv"
   "srv/GetAdmittanceState.srv"
+  "srv/SetToolDriveConfig.srv"
+  "srv/SetToolDriveFrame.srv"
+  "srv/SetToolDriveTuning.srv"
+  "srv/GetToolDriveState.srv"
    DEPENDENCIES std_msgs std_srvs
 )
 

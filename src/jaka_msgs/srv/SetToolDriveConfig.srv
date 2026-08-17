@@ -1,0 +1,9 @@
+# 轴编号 0..5 分别对应 X、Y、Z、RX、RY、RZ。
+int32 axis
+int32 option
+float64 rebound
+float64 rigidity
+---
+bool success
+int32 error_code
+string message

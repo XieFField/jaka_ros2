@@ -29,6 +29,10 @@
 #include "jaka_msgs/srv/get_admittance_state.hpp"
 #include "jaka_msgs/srv/set_force_control_frame.hpp"
 #include "jaka_msgs/srv/set_torque_sensor_soft_limit.hpp"
+#include "jaka_msgs/srv/set_tool_drive_config.hpp"
+#include "jaka_msgs/srv/set_tool_drive_frame.hpp"
+#include "jaka_msgs/srv/set_tool_drive_tuning.hpp"
+#include "jaka_msgs/srv/get_tool_drive_state.hpp"
 
 #include "jaka_driver/JAKAZuRobot.h"
 #include "jaka_driver/jkerr.h"
@@ -321,7 +325,10 @@ void get_admittance_state_callback(
         response->normal_track[axis] = config.ft_normal_track;
         response->rebound_wrench[axis] = config.ft_rebound;
     }
-    response->force_control_enabled = control_enabled != 0;
+    // 旧控制器通过传统接口提供手动导纳，但不会同步更新
+    // get_ft_ctrl_mode()。SDK 启用成功后，以驱动的独占控制权表示该接口状态。
+    response->force_control_enabled = control_enabled != 0 ||
+        control_owner.load() == jaka_driver::ControlOwner::kCompliance;
     response->force_control_frame = static_cast<int>(control_frame);
     response->sensor_compensation = sensor_compensation;
     response->compliance_type = compliance_type;
@@ -384,7 +391,12 @@ void enable_admittance_callback(
     else
     {
         robot.motion_abort();
-        ret = robot.disable_force_control();
+        ret = robot.enable_admittance_ctrl(0);
+        if (ret != 0)
+        {
+            // 兼容仅提供统一力控关闭接口的控制器版本。
+            ret = robot.disable_force_control();
+        }
         jaka_driver::release_control(
             control_owner, jaka_driver::ControlOwner::kCompliance);
     }
@@ -397,6 +409,316 @@ void enable_admittance_callback(
     response->message = ret == 0 ?
         (request->data ? "Admittance enabled" : "Force control disabled") :
         "JAKA force-control operation failed: " + std::to_string(ret);
+}
+
+void set_tool_drive_config_callback(
+    const std::shared_ptr<jaka_msgs::srv::SetToolDriveConfig::Request> request,
+    std::shared_ptr<jaka_msgs::srv::SetToolDriveConfig::Response> response)
+{
+    if (request->axis < 0 || request->axis >= 6 ||
+        (request->option != 0 && request->option != 1) ||
+        !std::isfinite(request->rebound) || request->rebound < 0.0 ||
+        !std::isfinite(request->rigidity) || request->rigidity < 0.0)
+    {
+        response->success = false;
+        response->error_code = -2;
+        response->message = "Invalid tool-drive configuration";
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(session_mutex);
+    if (!sdk_logged_in.load())
+    {
+        response->success = false;
+        response->error_code = -1;
+        response->message = "SDK is not logged in";
+        return;
+    }
+
+    ToolDriveConfig configuration{};
+    configuration.axis = request->axis;
+    configuration.opt = request->option;
+    configuration.rebound = request->rebound;
+    configuration.rigidity = request->rigidity;
+    const int ret = robot.set_tool_drive_config(configuration);
+    response->success = ret == 0;
+    response->error_code = ret;
+    response->message = ret == 0 ?
+        "Tool-drive axis configured" :
+        "set_tool_drive_config failed: " + std::to_string(ret);
+}
+
+void set_tool_drive_frame_callback(
+    const std::shared_ptr<jaka_msgs::srv::SetToolDriveFrame::Request> request,
+    std::shared_ptr<jaka_msgs::srv::SetToolDriveFrame::Response> response)
+{
+    if (request->frame != 0 && request->frame != 1)
+    {
+        response->success = false;
+        response->error_code = -2;
+        response->message = "Tool-drive frame must be 0 or 1";
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(session_mutex);
+    if (!sdk_logged_in.load())
+    {
+        response->success = false;
+        response->error_code = -1;
+        response->message = "SDK is not logged in";
+        return;
+    }
+    const int ret = robot.set_tool_drive_frame(
+        static_cast<FTFrameType>(request->frame));
+    response->success = ret == 0;
+    response->error_code = ret;
+    response->message = ret == 0 ?
+        "Tool-drive frame configured" :
+        "set_tool_drive_frame failed: " + std::to_string(ret);
+}
+
+void set_tool_drive_tuning_callback(
+    const std::shared_ptr<jaka_msgs::srv::SetToolDriveTuning::Request> request,
+    std::shared_ptr<jaka_msgs::srv::SetToolDriveTuning::Response> response)
+{
+    if (request->sensitivity_level < 0 || request->sensitivity_level > 5 ||
+        request->warning_range < 1 || request->warning_range > 5)
+    {
+        response->success = false;
+        response->error_code = -2;
+        response->message =
+            "Tool-drive sensitivity must be 0..5 and warning range 1..5";
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(session_mutex);
+    if (!sdk_logged_in.load())
+    {
+        response->success = false;
+        response->error_code = -1;
+        response->message = "SDK is not logged in";
+        return;
+    }
+
+    int previous_sensitivity = 0;
+    int previous_warning_range = 0;
+    int ret = robot.get_fusion_drive_sensitivity_level(
+        &previous_sensitivity);
+    if (ret == 0)
+    {
+        ret = robot.get_motion_limit_warning_range(
+            &previous_warning_range);
+    }
+    bool sensitivity_changed = false;
+    if (ret == 0)
+    {
+        ret = robot.set_fusion_drive_sensitivity_level(
+            request->sensitivity_level);
+        sensitivity_changed = ret == 0;
+    }
+    if (ret == 0)
+    {
+        ret = robot.set_motion_limit_warning_range(request->warning_range);
+    }
+    if (ret == 0)
+    {
+        int actual_sensitivity = 0;
+        int actual_warning_range = 0;
+        ret = robot.get_fusion_drive_sensitivity_level(&actual_sensitivity);
+        if (ret == 0)
+        {
+            ret = robot.get_motion_limit_warning_range(&actual_warning_range);
+        }
+        if (ret == 0 &&
+            (actual_sensitivity != request->sensitivity_level ||
+            actual_warning_range != request->warning_range))
+        {
+            ret = -2;
+            response->message = "Tool-drive tuning readback mismatch";
+        }
+    }
+
+    if (ret != 0 && sensitivity_changed)
+    {
+        const int sensitivity_rollback =
+            robot.set_fusion_drive_sensitivity_level(previous_sensitivity);
+        const int warning_rollback =
+            robot.set_motion_limit_warning_range(previous_warning_range);
+        if (response->message.empty())
+        {
+            response->message =
+                "Setting tool-drive tuning failed: " + std::to_string(ret);
+        }
+        response->message +=
+            "; rollback sensitivity=" +
+            std::to_string(sensitivity_rollback) +
+            ", warning_range=" + std::to_string(warning_rollback);
+    }
+
+    response->success = ret == 0;
+    response->error_code = ret;
+    if (ret == 0)
+    {
+        response->message = "Tool-drive global tuning configured";
+    }
+    else if (response->message.empty())
+    {
+        response->message =
+            "Reading or setting tool-drive global tuning failed: " +
+            std::to_string(ret);
+    }
+}
+
+void get_tool_drive_state_callback(
+    const std::shared_ptr<jaka_msgs::srv::GetToolDriveState::Request>,
+    std::shared_ptr<jaka_msgs::srv::GetToolDriveState::Response> response)
+{
+    std::lock_guard<std::mutex> lock(session_mutex);
+    if (!sdk_logged_in.load())
+    {
+        response->success = false;
+        response->error_code = -1;
+        response->message = "SDK is not logged in";
+        return;
+    }
+
+    int enabled = 0;
+    int warning_state = 0;
+    int sensitivity_level = 0;
+    int warning_range = 0;
+    FTFrameType frame = FTFrame_Tool;
+    RobotToolDriveCtrl configurations{};
+    int ret = robot.get_tool_drive_state(&enabled, &warning_state);
+    if (ret == 0)
+    {
+        ret = robot.get_tool_drive_frame(&frame);
+    }
+    if (ret == 0)
+    {
+        ret = robot.get_tool_drive_config(&configurations);
+    }
+    if (ret == 0)
+    {
+        ret = robot.get_fusion_drive_sensitivity_level(&sensitivity_level);
+    }
+    if (ret == 0)
+    {
+        ret = robot.get_motion_limit_warning_range(&warning_range);
+    }
+    if (ret != 0)
+    {
+        response->success = false;
+        response->error_code = ret;
+        response->message =
+            "Reading JAKA tool-drive state failed: " + std::to_string(ret);
+        return;
+    }
+
+    response->enabled = enabled != 0;
+    response->warning_state = warning_state;
+    response->frame = static_cast<int>(frame);
+    response->control_owner = jaka_driver::control_owner_name(
+        control_owner.load());
+    response->sensitivity_level = sensitivity_level;
+    response->warning_range = warning_range;
+    for (std::size_t axis = 0; axis < 6U; ++axis)
+    {
+        response->axis_options[axis] = configurations.config[axis].opt;
+        response->rebound[axis] = configurations.config[axis].rebound;
+        response->rigidity[axis] = configurations.config[axis].rigidity;
+    }
+    response->success = true;
+    response->error_code = 0;
+    response->message = "JAKA tool-drive state read successfully";
+}
+
+void enable_tool_drive_callback(
+    const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+    std::shared_ptr<std_srvs::srv::SetBool::Response> response)
+{
+    if (request->data)
+    {
+        const auto owner = control_owner.load();
+        if (owner != jaka_driver::ControlOwner::kToolDrive &&
+            !jaka_driver::try_acquire_control(
+                control_owner, jaka_driver::ControlOwner::kToolDrive))
+        {
+            response->success = false;
+            response->message = std::string("Control is owned by ") +
+                jaka_driver::control_owner_name(control_owner.load());
+            return;
+        }
+    }
+    else if (control_owner.load() != jaka_driver::ControlOwner::kIdle &&
+        control_owner.load() != jaka_driver::ControlOwner::kToolDrive)
+    {
+        response->success = false;
+        response->message = std::string("Control is owned by ") +
+            jaka_driver::control_owner_name(control_owner.load());
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(session_mutex);
+    if (!sdk_logged_in.load())
+    {
+        if (request->data)
+        {
+            jaka_driver::release_control(
+                control_owner, jaka_driver::ControlOwner::kToolDrive);
+        }
+        response->success = false;
+        response->message = "SDK is not logged in";
+        return;
+    }
+
+    int ret = 0;
+    int cleanup_ret = 0;
+    if (request->data)
+    {
+        int sensor_mode = 0;
+        ret = robot.get_torque_sensor_mode(&sensor_mode);
+        if (ret == 0 && sensor_mode == 0)
+        {
+            ret = -2;
+        }
+        int sensitivity_level = 0;
+        if (ret == 0)
+        {
+            ret = robot.get_fusion_drive_sensitivity_level(
+                &sensitivity_level);
+        }
+        if (ret == 0 && sensitivity_level == 0)
+        {
+            jaka_driver::release_control(
+                control_owner, jaka_driver::ControlOwner::kToolDrive);
+            response->success = false;
+            response->message =
+                "Fusion-drive sensitivity is 0; tool drive is disabled";
+            return;
+        }
+        if (ret == 0)
+        {
+            ret = robot.enable_tool_drive(1);
+        }
+        if (ret != 0)
+        {
+            cleanup_ret = robot.enable_tool_drive(0);
+            jaka_driver::release_control(
+                control_owner, jaka_driver::ControlOwner::kToolDrive);
+        }
+    }
+    else
+    {
+        ret = robot.enable_tool_drive(0);
+        jaka_driver::release_control(
+            control_owner, jaka_driver::ControlOwner::kToolDrive);
+    }
+
+    response->success = ret == 0;
+    response->message = ret == 0 ?
+        (request->data ? "Tool drive enabled" : "Tool drive disabled") :
+        "JAKA tool-drive operation failed: " + std::to_string(ret) +
+        "; forced disable=" + std::to_string(cleanup_ret);
 }
 
 void zero_ft_sensor_callback(
@@ -776,6 +1098,13 @@ void stop_move_callback(
             ret = abort_ret != 0 ? abort_ret : disable_ret;
             jaka_driver::release_control(
                 control_owner, jaka_driver::ControlOwner::kCompliance);
+        }
+        else if (owner == jaka_driver::ControlOwner::kToolDrive)
+        {
+            const int disable_ret = robot.enable_tool_drive(0);
+            ret = abort_ret != 0 ? abort_ret : disable_ret;
+            jaka_driver::release_control(
+                control_owner, jaka_driver::ControlOwner::kToolDrive);
         }
         else
         {
@@ -1564,6 +1893,8 @@ void disable_robot_callback(
     // Stop current motion before disabling.
     robot.motion_abort();
     robot.servo_move_enable(FALSE);
+    robot.enable_tool_drive(0);
+    robot.disable_force_control();
     control_owner.store(jaka_driver::ControlOwner::kIdle);
 
     int ret = robot.disable_robot();
@@ -1778,6 +2109,11 @@ int main(int argc, char *argv[])
     auto admittance_state_service = node->create_service<jaka_msgs::srv::GetAdmittanceState>("/jaka_driver/get_admittance_state", &get_admittance_state_callback, rmw_qos_profile_services_default, sdk_callback_group);
     auto admittance_enable_service = node->create_service<std_srvs::srv::SetBool>("/jaka_driver/enable_admittance", &enable_admittance_callback, rmw_qos_profile_services_default, interrupt_callback_group);
     auto zero_ft_service = node->create_service<std_srvs::srv::Trigger>("/jaka_driver/zero_ft_sensor", &zero_ft_sensor_callback, rmw_qos_profile_services_default, sdk_callback_group);
+    auto tool_drive_config_service = node->create_service<jaka_msgs::srv::SetToolDriveConfig>("/jaka_driver/set_tool_drive_config", &set_tool_drive_config_callback, rmw_qos_profile_services_default, sdk_callback_group);
+    auto tool_drive_frame_service = node->create_service<jaka_msgs::srv::SetToolDriveFrame>("/jaka_driver/set_tool_drive_frame", &set_tool_drive_frame_callback, rmw_qos_profile_services_default, sdk_callback_group);
+    auto tool_drive_tuning_service = node->create_service<jaka_msgs::srv::SetToolDriveTuning>("/jaka_driver/set_tool_drive_tuning", &set_tool_drive_tuning_callback, rmw_qos_profile_services_default, sdk_callback_group);
+    auto tool_drive_state_service = node->create_service<jaka_msgs::srv::GetToolDriveState>("/jaka_driver/get_tool_drive_state", &get_tool_drive_state_callback, rmw_qos_profile_services_default, sdk_callback_group);
+    auto tool_drive_enable_service = node->create_service<std_srvs::srv::SetBool>("/jaka_driver/enable_tool_drive", &enable_tool_drive_callback, rmw_qos_profile_services_default, interrupt_callback_group);
 
     auto trajectory_action_server =
         std::make_shared<jaka_driver::FollowJointTrajectoryServer>(
