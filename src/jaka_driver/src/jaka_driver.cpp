@@ -1994,6 +1994,13 @@ void get_conn_scoket_state(){
             rclcpp::sleep_for(chrono::milliseconds(100));
             continue;
         }
+        if (control_owner.load() == jaka_driver::ControlOwner::kTrajectory)
+        {
+            // FollowJointTrajectory owns the only SDK session while streaming.
+            // Background state polling would otherwise delay synchronous servo_j calls.
+            rclcpp::sleep_for(chrono::milliseconds(20));
+            continue;
+        }
 
         int ret;
         {

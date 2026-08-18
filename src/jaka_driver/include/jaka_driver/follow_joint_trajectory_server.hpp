@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -56,7 +57,9 @@ private:
     bool wait_until(
         const std::chrono::steady_clock::time_point & deadline,
         const std::shared_ptr<GoalHandle> & goal_handle);
-    int stop_motion_and_servo();
+    int abort_motion_and_exit_servo();
+    int exit_servo_mode();
+    void log_sdk_state_locked(const std::string & context);
     std::vector<double> reordered_positions(
         const std::vector<std::string> & names,
         const std::vector<double> & positions) const;
@@ -77,9 +80,12 @@ private:
         "joint_4", "joint_5", "joint_6"};
     double goal_tolerance_{0.01};
     double goal_timeout_{2.0};
-    double servo_period_{0.008};
-    unsigned int maximum_servo_steps_{50};
+    unsigned int servo_step_num_{4U};
+    std::size_t maximum_servo_samples_{50000U};
     double maximum_trajectory_duration_{300.0};
+    double feedback_period_{0.1};
+    double maximum_lateness_{0.008};
+    std::size_t maximum_consecutive_overruns_{1U};
 
     mutable std::mutex worker_mutex_;
     std::thread worker_;
