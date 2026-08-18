@@ -1,8 +1,8 @@
 #ifndef JAKA_DRIVER__TRAJECTORY_UTILS_HPP_
 #define JAKA_DRIVER__TRAJECTORY_UTILS_HPP_
 
-#include <optional>
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -14,39 +14,51 @@ namespace jaka_driver
 constexpr double kJakaServoInterpolationCycle = 0.008;
 constexpr unsigned int kMaximumServoStepNum = 50U;
 
-struct TimedServoSetpoint
+struct QueuedServoSetpoint
 {
-    double command_time{0.0};
-    double reference_time{0.0};
+    double controller_start_time{0.0};
+    double controller_finish_time{0.0};
+    double source_reference_time{0.0};
     unsigned int step_num{1U};
     std::vector<double> positions;
 };
 
-struct TimedServoSchedule
+struct QueuedServoSchedule
 {
     bool valid{false};
     std::string error;
     double planned_duration{0.0};
     double scheduled_duration{0.0};
-    std::vector<TimedServoSetpoint> setpoints;
+    std::vector<QueuedServoSetpoint> setpoints;
 };
 
 struct ServoCallTiming
 {
-    double scheduled_time{0.0};
-    double call_started_time{0.0};
-    double call_finished_time{0.0};
+    double call_duration{0.0};
+    double queue_starvation{0.0};
 };
 
 struct ServoTimingSummary
 {
     std::size_t samples{0U};
-    std::size_t late_samples{0U};
-    double maximum_lateness{0.0};
+    std::size_t starved_samples{0U};
+    double maximum_queue_starvation{0.0};
     double call_duration_p50{0.0};
     double call_duration_p95{0.0};
     double call_duration_p99{0.0};
     double maximum_call_duration{0.0};
+};
+
+struct EndpointProgress
+{
+    bool valid{false};
+    std::size_t maximum_command_joint{0U};
+    std::size_t maximum_error_joint{0U};
+    double maximum_commanded_delta{0.0};
+    double achieved_delta_on_command_joint{0.0};
+    double completion_ratio{0.0};
+    double maximum_absolute_error{0.0};
+    std::vector<double> absolute_errors;
 };
 
 // 与 JAKA S5 轨迹执行相关的纯校验和换序函数，保持与 SDK 解耦，便于离线测试。
@@ -61,7 +73,8 @@ std::vector<double> reorder_joint_values(
     const std::vector<double> & source_values,
     const std::vector<std::string> & expected_joint_names);
 
-// 返回从 previous_time 到 current_time 所需的 JAKA 8 ms 插补周期数。
+// 返回覆盖 previous_time 到 current_time 所需的 JAKA 插补周期数；向上取整，
+// 确保量化后的控制柜时间轴不会短于 MoveIt 源轨迹。
 std::optional<unsigned int> interpolation_steps(
     double previous_time,
     double current_time,
@@ -74,31 +87,41 @@ bool validate_servo_segments(
     unsigned int maximum_servo_steps,
     std::string & error);
 
-// 将 MoveIt 轨迹按 step_num * 8 ms 的主机命令周期重采样。step_num 同时
-// 传给 servo_j，让控制柜在相同持续时间内完成本段内部插补。
-TimedServoSchedule build_timed_servo_schedule(
+// 将 MoveIt 轨迹按 step_num * 8 ms 的控制柜插补周期重采样。所有分段应按
+// SDK 要求连续提交，由控制柜按照 controller_start/finish_time 顺序执行。
+QueuedServoSchedule build_queued_servo_schedule(
     const trajectory_msgs::msg::JointTrajectory & trajectory,
     const std::vector<std::string> & expected_joint_names,
     const std::vector<double> & initial_positions,
     double interpolation_cycle,
-    unsigned int step_num,
+    unsigned int maximum_step_num,
     std::size_t maximum_samples);
+
+std::optional<std::vector<double>> sample_queued_servo_schedule(
+    const QueuedServoSchedule & schedule,
+    const std::vector<double> & initial_positions,
+    double controller_elapsed);
 
 ServoTimingSummary summarize_servo_timing(
     const std::vector<ServoCallTiming> & calls,
-    double lateness_threshold);
+    double starvation_threshold);
 
-// 返回 true 表示连续超限次数已经超过允许值，应停止发送过期设定点。
-bool update_servo_overrun_state(
-    double lateness,
-    double maximum_lateness,
-    std::size_t maximum_consecutive_overruns,
-    std::size_t & consecutive_overruns);
+// 返回 true 表示连续队列饥饿次数已经超过允许值，应停止填充控制柜队列。
+bool update_servo_starvation_state(
+    double starvation,
+    double maximum_starvation,
+    std::size_t maximum_consecutive_starvations,
+    std::size_t & consecutive_starvations);
 
 std::optional<double> endpoint_deadline_offset(
     double scheduled_duration,
     double send_completed_time,
     double goal_timeout);
+
+EndpointProgress calculate_endpoint_progress(
+    const std::vector<double> & initial_positions,
+    const std::vector<double> & target_positions,
+    const std::vector<double> & actual_positions);
 
 }  // namespace jaka_driver
 

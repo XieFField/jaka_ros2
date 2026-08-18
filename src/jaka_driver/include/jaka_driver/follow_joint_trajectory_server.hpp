@@ -54,9 +54,6 @@ private:
         const Action::Goal & goal,
         std::string & error) const;
     bool robot_ready(std::string & error);
-    bool wait_until(
-        const std::chrono::steady_clock::time_point & deadline,
-        const std::shared_ptr<GoalHandle> & goal_handle);
     int abort_motion_and_exit_servo();
     int exit_servo_mode();
     void log_sdk_state_locked(const std::string & context);
@@ -78,14 +75,15 @@ private:
     const std::vector<std::string> expected_joint_names_{
         "joint_1", "joint_2", "joint_3",
         "joint_4", "joint_5", "joint_6"};
-    double goal_tolerance_{0.01};
+    double goal_tolerance_{0.002};
     double goal_timeout_{2.0};
-    unsigned int servo_step_num_{4U};
+    unsigned int maximum_servo_step_num_{50U};
     std::size_t maximum_servo_samples_{50000U};
     double maximum_trajectory_duration_{300.0};
     double feedback_period_{0.1};
-    double maximum_lateness_{0.008};
-    std::size_t maximum_consecutive_overruns_{1U};
+    double servo_filter_cutoff_hz_{0.5};
+    double maximum_queue_starvation_{0.008};
+    std::size_t maximum_consecutive_starvations_{1U};
 
     mutable std::mutex worker_mutex_;
     std::thread worker_;

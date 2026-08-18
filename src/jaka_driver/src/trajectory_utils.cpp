@@ -152,12 +152,15 @@ std::optional<unsigned int> interpolation_steps(
     {
         return std::nullopt;
     }
-    const double rounded = std::max(1.0, std::round(interval / servo_period));
-    if (rounded > static_cast<double>(std::numeric_limits<unsigned int>::max()))
+    constexpr double kIntegerRatioTolerance = 1e-9;
+    const double steps = std::max(
+        1.0,
+        std::ceil(interval / servo_period - kIntegerRatioTolerance));
+    if (steps > static_cast<double>(std::numeric_limits<unsigned int>::max()))
     {
         return std::nullopt;
     }
-    return static_cast<unsigned int>(rounded);
+    return static_cast<unsigned int>(steps);
 }
 
 bool validate_servo_segments(
@@ -196,17 +199,17 @@ bool validate_servo_segments(
     return true;
 }
 
-TimedServoSchedule build_timed_servo_schedule(
+QueuedServoSchedule build_queued_servo_schedule(
     const trajectory_msgs::msg::JointTrajectory & trajectory,
     const std::vector<std::string> & expected_joint_names,
     const std::vector<double> & initial_positions,
     double interpolation_cycle,
-    unsigned int step_num,
+    unsigned int maximum_step_num,
     std::size_t maximum_samples)
 {
-    TimedServoSchedule schedule;
+    QueuedServoSchedule schedule;
     if (!std::isfinite(interpolation_cycle) || interpolation_cycle <= 0.0 ||
-        step_num == 0U || step_num > kMaximumServoStepNum ||
+        maximum_step_num == 0U || maximum_step_num > kMaximumServoStepNum ||
         maximum_samples == 0U ||
         initial_positions.size() != expected_joint_names.size() ||
         !finite_values(initial_positions) || trajectory.points.empty())
@@ -215,96 +218,135 @@ TimedServoSchedule build_timed_servo_schedule(
         return schedule;
     }
 
-    struct Knot
-    {
-        double time;
-        std::vector<double> positions;
-    };
-    std::vector<Knot> knots{{0.0, initial_positions}};
-    knots.reserve(trajectory.points.size() + 1U);
+    double previous_source_time = 0.0;
+    std::vector<double> previous_positions = initial_positions;
+    double controller_time = 0.0;
     for (const auto & point : trajectory.points)
     {
-        const double time = duration_seconds(point.time_from_start);
+        const double source_time = duration_seconds(point.time_from_start);
         auto positions = reorder_joint_values(
             trajectory.joint_names, point.positions, expected_joint_names);
-        if (!std::isfinite(time) || time < 0.0 ||
+        if (!std::isfinite(source_time) || source_time < previous_source_time ||
             positions.size() != expected_joint_names.size() ||
-            !finite_values(positions) || time < knots.back().time)
+            !finite_values(positions))
         {
             schedule.error = "servo 重采样输入包含无效时间或关节位置";
             return schedule;
         }
-        if (time == knots.back().time)
-        {
-            knots.back().positions = std::move(positions);
-        }
-        else
-        {
-            knots.push_back({time, std::move(positions)});
-        }
-    }
 
-    const double command_period =
-        interpolation_cycle * static_cast<double>(step_num);
-    if (!std::isfinite(command_period) || command_period <= 0.0)
-    {
-        schedule.error = "servo 命令周期无效";
-        return schedule;
-    }
-
-    schedule.planned_duration = knots.back().time;
-    const double raw_sample_count = std::max(
-        1.0, std::ceil(schedule.planned_duration / command_period));
-    if (!std::isfinite(raw_sample_count) ||
-        raw_sample_count > static_cast<double>(maximum_samples))
-    {
-        schedule.error = "servo 重采样点数超过配置上限";
-        return schedule;
-    }
-    const auto sample_count = static_cast<std::size_t>(raw_sample_count);
-    schedule.scheduled_duration =
-        static_cast<double>(sample_count) * command_period;
-    schedule.setpoints.reserve(sample_count);
-
-    std::size_t right_index = knots.size() > 1U ? 1U : 0U;
-    for (std::size_t sample_index = 0; sample_index < sample_count; ++sample_index)
-    {
-        const double reference_time = std::min(
-            static_cast<double>(sample_index + 1U) * command_period,
-            schedule.planned_duration);
-        while (right_index + 1U < knots.size() &&
-            knots[right_index].time < reference_time)
+        if (source_time == previous_source_time)
         {
-            ++right_index;
+            if (source_time == 0.0)
+            {
+                previous_positions = std::move(positions);
+                continue;
+            }
+            if (!same_positions(positions, previous_positions))
+            {
+                schedule.error = "相同时间的 servo 分段位置不一致";
+                return schedule;
+            }
+            continue;
         }
 
-        std::vector<double> positions;
-        if (knots.size() == 1U || reference_time >= knots.back().time)
+        const auto total_steps = interpolation_steps(
+            previous_source_time, source_time, interpolation_cycle);
+        if (!total_steps)
         {
-            positions = knots.back().positions;
+            schedule.error = "轨迹时间段无法转换为控制柜插补周期";
+            return schedule;
         }
-        else
+        const auto segment_count = static_cast<unsigned int>(
+            (*total_steps + maximum_step_num - 1U) / maximum_step_num);
+        const unsigned int base_steps = *total_steps / segment_count;
+        const unsigned int extra_steps = *total_steps % segment_count;
+        unsigned int accumulated_steps = 0U;
+        for (unsigned int segment = 0U; segment < segment_count; ++segment)
         {
-            const auto & right = knots[right_index];
-            const auto & left = knots[right_index - 1U];
-            const double ratio = (reference_time - left.time) /
-                (right.time - left.time);
-            positions.resize(expected_joint_names.size());
+            const unsigned int segment_steps =
+                base_steps + (segment < extra_steps ? 1U : 0U);
+            accumulated_steps += segment_steps;
+            const double ratio = static_cast<double>(accumulated_steps) /
+                static_cast<double>(*total_steps);
+            std::vector<double> segment_positions(positions.size());
             for (std::size_t joint = 0; joint < positions.size(); ++joint)
             {
-                positions[joint] = left.positions[joint] +
-                    ratio * (right.positions[joint] - left.positions[joint]);
+                segment_positions[joint] = previous_positions[joint] +
+                    ratio * (positions[joint] - previous_positions[joint]);
             }
+            const double segment_duration = interpolation_cycle *
+                static_cast<double>(segment_steps);
+            if (schedule.setpoints.size() >= maximum_samples)
+            {
+                schedule.error = "servo 队列分段数超过配置上限";
+                return schedule;
+            }
+            schedule.setpoints.push_back({
+                controller_time,
+                controller_time + segment_duration,
+                previous_source_time + ratio *
+                (source_time - previous_source_time),
+                segment_steps,
+                std::move(segment_positions)});
+            controller_time += segment_duration;
         }
-
-        schedule.setpoints.push_back({
-            static_cast<double>(sample_index) * command_period,
-            reference_time,
-            step_num,
-            std::move(positions)});
+        previous_source_time = source_time;
+        previous_positions = std::move(positions);
     }
+
+    if (schedule.setpoints.empty())
+    {
+        schedule.error = "轨迹没有需要提交的非零时长 servo 分段";
+        return schedule;
+    }
+    schedule.planned_duration = previous_source_time;
+    schedule.scheduled_duration = controller_time;
     schedule.valid = true;
     return schedule;
+}
+
+std::optional<std::vector<double>> sample_queued_servo_schedule(
+    const QueuedServoSchedule & schedule,
+    const std::vector<double> & initial_positions,
+    double controller_elapsed)
+{
+    if (!schedule.valid || schedule.setpoints.empty() ||
+        !std::isfinite(controller_elapsed) || controller_elapsed < 0.0 ||
+        initial_positions.empty() || !finite_values(initial_positions))
+    {
+        return std::nullopt;
+    }
+
+    double previous_time = 0.0;
+    const std::vector<double> * previous_positions = &initial_positions;
+    for (const auto & setpoint : schedule.setpoints)
+    {
+        if (setpoint.positions.size() != initial_positions.size() ||
+            !finite_values(setpoint.positions) ||
+            !std::isfinite(setpoint.controller_finish_time) ||
+            setpoint.controller_finish_time <= previous_time)
+        {
+            return std::nullopt;
+        }
+        if (controller_elapsed <= setpoint.controller_finish_time)
+        {
+            const double ratio = std::clamp(
+                (controller_elapsed - previous_time) /
+                (setpoint.controller_finish_time - previous_time),
+                0.0, 1.0);
+            std::vector<double> positions(initial_positions.size());
+            for (std::size_t joint = 0; joint < positions.size(); ++joint)
+            {
+                positions[joint] = (*previous_positions)[joint] +
+                    ratio * (setpoint.positions[joint] -
+                    (*previous_positions)[joint]);
+            }
+            return positions;
+        }
+        previous_time = setpoint.controller_finish_time;
+        previous_positions = &setpoint.positions;
+    }
+    return schedule.setpoints.back().positions;
 }
 
 namespace
@@ -331,10 +373,10 @@ double percentile(
 
 ServoTimingSummary summarize_servo_timing(
     const std::vector<ServoCallTiming> & calls,
-    double lateness_threshold)
+    double starvation_threshold)
 {
     ServoTimingSummary summary;
-    if (!std::isfinite(lateness_threshold) || lateness_threshold < 0.0)
+    if (!std::isfinite(starvation_threshold) || starvation_threshold < 0.0)
     {
         return summary;
     }
@@ -343,24 +385,18 @@ ServoTimingSummary summarize_servo_timing(
     durations.reserve(calls.size());
     for (const auto & call : calls)
     {
-        if (!std::isfinite(call.scheduled_time) ||
-            !std::isfinite(call.call_started_time) ||
-            !std::isfinite(call.call_finished_time) ||
-            call.call_started_time < call.scheduled_time ||
-            call.call_finished_time < call.call_started_time)
+        if (!std::isfinite(call.call_duration) || call.call_duration < 0.0 ||
+            !std::isfinite(call.queue_starvation) || call.queue_starvation < 0.0)
         {
             continue;
         }
-        const double lateness = call.call_started_time - call.scheduled_time;
-        const double duration =
-            call.call_finished_time - call.call_started_time;
-        summary.maximum_lateness = std::max(
-            summary.maximum_lateness, lateness);
-        if (lateness > lateness_threshold)
+        summary.maximum_queue_starvation = std::max(
+            summary.maximum_queue_starvation, call.queue_starvation);
+        if (call.queue_starvation > starvation_threshold)
         {
-            ++summary.late_samples;
+            ++summary.starved_samples;
         }
-        durations.push_back(duration);
+        durations.push_back(call.call_duration);
     }
 
     std::sort(durations.begin(), durations.end());
@@ -375,26 +411,26 @@ ServoTimingSummary summarize_servo_timing(
     return summary;
 }
 
-bool update_servo_overrun_state(
-    double lateness,
-    double maximum_lateness,
-    std::size_t maximum_consecutive_overruns,
-    std::size_t & consecutive_overruns)
+bool update_servo_starvation_state(
+    double starvation,
+    double maximum_starvation,
+    std::size_t maximum_consecutive_starvations,
+    std::size_t & consecutive_starvations)
 {
-    if (!std::isfinite(lateness) || !std::isfinite(maximum_lateness) ||
-        maximum_lateness < 0.0)
+    if (!std::isfinite(starvation) || !std::isfinite(maximum_starvation) ||
+        maximum_starvation < 0.0)
     {
         return true;
     }
-    if (lateness > maximum_lateness)
+    if (starvation > maximum_starvation)
     {
-        ++consecutive_overruns;
+        ++consecutive_starvations;
     }
     else
     {
-        consecutive_overruns = 0U;
+        consecutive_starvations = 0U;
     }
-    return consecutive_overruns > maximum_consecutive_overruns;
+    return consecutive_starvations > maximum_consecutive_starvations;
 }
 
 std::optional<double> endpoint_deadline_offset(
@@ -409,6 +445,56 @@ std::optional<double> endpoint_deadline_offset(
         return std::nullopt;
     }
     return std::max(scheduled_duration, send_completed_time) + goal_timeout;
+}
+
+EndpointProgress calculate_endpoint_progress(
+    const std::vector<double> & initial_positions,
+    const std::vector<double> & target_positions,
+    const std::vector<double> & actual_positions)
+{
+    EndpointProgress progress;
+    if (initial_positions.empty() ||
+        initial_positions.size() != target_positions.size() ||
+        initial_positions.size() != actual_positions.size() ||
+        !finite_values(initial_positions) || !finite_values(target_positions) ||
+        !finite_values(actual_positions))
+    {
+        return progress;
+    }
+
+    progress.absolute_errors.resize(initial_positions.size());
+    for (std::size_t joint = 0; joint < initial_positions.size(); ++joint)
+    {
+        const double commanded_delta = std::abs(
+            target_positions[joint] - initial_positions[joint]);
+        if (commanded_delta > progress.maximum_commanded_delta)
+        {
+            progress.maximum_commanded_delta = commanded_delta;
+            progress.maximum_command_joint = joint;
+        }
+
+        const double target_error = std::abs(
+            target_positions[joint] - actual_positions[joint]);
+        progress.absolute_errors[joint] = target_error;
+        if (target_error > progress.maximum_absolute_error)
+        {
+            progress.maximum_absolute_error = target_error;
+            progress.maximum_error_joint = joint;
+        }
+    }
+
+    const auto command_joint = progress.maximum_command_joint;
+    const double signed_command =
+        target_positions[command_joint] - initial_positions[command_joint];
+    const double signed_actual_delta =
+        actual_positions[command_joint] - initial_positions[command_joint];
+    progress.achieved_delta_on_command_joint =
+        signed_command >= 0.0 ? signed_actual_delta : -signed_actual_delta;
+    progress.completion_ratio = progress.maximum_commanded_delta > 0.0 ?
+        progress.achieved_delta_on_command_joint /
+        progress.maximum_commanded_delta : 1.0;
+    progress.valid = true;
+    return progress;
 }
 
 }  // namespace jaka_driver

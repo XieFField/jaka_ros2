@@ -6,7 +6,6 @@
 #include <fstream>
 #include <functional>
 #include <iomanip>
-#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -35,11 +34,11 @@ struct TrackingSample
     std::string phase;
     std::size_t sample_index{0U};
     double elapsed{0.0};
-    double scheduled_time{0.0};
+    double controller_segment_start{0.0};
     double call_started_time{0.0};
     double call_finished_time{0.0};
     double call_duration{0.0};
-    double lateness{0.0};
+    double queue_starvation{0.0};
     unsigned int step_num{0U};
     std::vector<double> desired;
     std::vector<double> actual;
@@ -67,9 +66,9 @@ bool write_tracking_csv(
     {
         return false;
     }
-    stream << "phase,sample_index,elapsed_s,scheduled_time_s,"
+    stream << "phase,sample_index,elapsed_s,controller_segment_start_s,"
               "call_started_time_s,call_finished_time_s,call_duration_s,"
-              "lateness_s,step_num";
+              "queue_starvation_s,step_num";
     for (std::size_t joint = 0; joint < 6U; ++joint)
     {
         stream << ",desired_joint_" << joint + 1U;
@@ -90,11 +89,11 @@ bool write_tracking_csv(
         stream << sample.phase
                << ',' << sample.sample_index
                << ',' << sample.elapsed
-               << ',' << sample.scheduled_time
+               << ',' << sample.controller_segment_start
                << ',' << sample.call_started_time
                << ',' << sample.call_finished_time
                << ',' << sample.call_duration
-               << ',' << sample.lateness
+               << ',' << sample.queue_starvation
                << ',' << sample.step_num;
         for (std::size_t joint = 0; joint < 6U; ++joint)
         {
@@ -170,34 +169,44 @@ FollowJointTrajectoryServer::FollowJointTrajectoryServer(
         "trajectory_goal_tolerance", goal_tolerance_);
     goal_timeout_ = node_->declare_parameter<double>(
         "trajectory_goal_timeout", goal_timeout_);
-    const auto servo_step_num = node_->declare_parameter<int64_t>(
-        "trajectory_servo_step_num", static_cast<int64_t>(servo_step_num_));
+    const auto maximum_servo_step_num = node_->declare_parameter<int64_t>(
+        "trajectory_maximum_servo_step_num",
+        static_cast<int64_t>(maximum_servo_step_num_));
     const auto maximum_servo_samples = node_->declare_parameter<int64_t>(
         "maximum_servo_samples", static_cast<int64_t>(maximum_servo_samples_));
     maximum_trajectory_duration_ = node_->declare_parameter<double>(
         "maximum_trajectory_duration", maximum_trajectory_duration_);
     feedback_period_ = node_->declare_parameter<double>(
         "trajectory_feedback_period", feedback_period_);
-    maximum_lateness_ = node_->declare_parameter<double>(
-        "trajectory_maximum_lateness", maximum_lateness_);
-    const auto maximum_consecutive_overruns = node_->declare_parameter<int64_t>(
-        "trajectory_maximum_consecutive_overruns",
-        static_cast<int64_t>(maximum_consecutive_overruns_));
+    servo_filter_cutoff_hz_ = node_->declare_parameter<double>(
+        "trajectory_servo_filter_cutoff_hz", servo_filter_cutoff_hz_);
+    maximum_queue_starvation_ = node_->declare_parameter<double>(
+        "trajectory_maximum_queue_starvation", maximum_queue_starvation_);
+    const auto maximum_consecutive_starvations =
+        node_->declare_parameter<int64_t>(
+        "trajectory_maximum_consecutive_starvations",
+        static_cast<int64_t>(maximum_consecutive_starvations_));
 
-    if (!(goal_tolerance_ > 0.0) || !(goal_timeout_ > 0.0) ||
-        !(maximum_trajectory_duration_ > 0.0) ||
-        servo_step_num <= 0 ||
-        servo_step_num > static_cast<int64_t>(kMaximumServoStepNum) ||
-        maximum_servo_samples <= 0 || maximum_consecutive_overruns < 0 ||
+    if (!std::isfinite(goal_tolerance_) || goal_tolerance_ <= 0.0 ||
+        !std::isfinite(goal_timeout_) || goal_timeout_ <= 0.0 ||
+        !std::isfinite(maximum_trajectory_duration_) ||
+        maximum_trajectory_duration_ <= 0.0 ||
+        maximum_servo_step_num <= 0 ||
+        maximum_servo_step_num > static_cast<int64_t>(kMaximumServoStepNum) ||
+        maximum_servo_samples <= 0 || maximum_consecutive_starvations < 0 ||
         !std::isfinite(feedback_period_) || feedback_period_ <= 0.0 ||
-        !std::isfinite(maximum_lateness_) || maximum_lateness_ < 0.0)
+        !std::isfinite(servo_filter_cutoff_hz_) ||
+        servo_filter_cutoff_hz_ < 0.0 ||
+        !std::isfinite(maximum_queue_starvation_) ||
+        maximum_queue_starvation_ < 0.0)
     {
         throw std::invalid_argument("轨迹 Action 的容差和周期参数必须大于零");
     }
-    servo_step_num_ = static_cast<unsigned int>(servo_step_num);
+    maximum_servo_step_num_ =
+        static_cast<unsigned int>(maximum_servo_step_num);
     maximum_servo_samples_ = static_cast<std::size_t>(maximum_servo_samples);
-    maximum_consecutive_overruns_ =
-        static_cast<std::size_t>(maximum_consecutive_overruns);
+    maximum_consecutive_starvations_ =
+        static_cast<std::size_t>(maximum_consecutive_starvations);
 
     server_ = rclcpp_action::create_server<Action>(
         node_,
@@ -218,11 +227,12 @@ FollowJointTrajectoryServer::FollowJointTrajectoryServer(
 
     RCLCPP_INFO(
         node_->get_logger(),
-        "JAKA trajectory Action ready: %s, step_num=%u, command_period=%.3f s, "
-        "maximum_lateness=%.3f s",
-        action_name.c_str(), servo_step_num_,
-        kJakaServoInterpolationCycle * static_cast<double>(servo_step_num_),
-        maximum_lateness_);
+        "JAKA trajectory Action ready: %s, goal_tolerance=%.6f rad, "
+        "goal_timeout=%.3f s, maximum_step_num=%u, servo_filter=%.3f Hz, "
+        "maximum_queue_starvation=%.3f s, allowed_consecutive_starvations=%zu",
+        action_name.c_str(), goal_tolerance_, goal_timeout_,
+        maximum_servo_step_num_, servo_filter_cutoff_hz_,
+        maximum_queue_starvation_, maximum_consecutive_starvations_);
 }
 
 FollowJointTrajectoryServer::~FollowJointTrajectoryServer()
@@ -342,22 +352,6 @@ bool FollowJointTrajectoryServer::robot_ready(std::string & error)
     {
         error = "机器人存在控制器故障: " + std::to_string(status.errcode);
         return false;
-    }
-    return true;
-}
-
-bool FollowJointTrajectoryServer::wait_until(
-    const std::chrono::steady_clock::time_point & deadline,
-    const std::shared_ptr<GoalHandle> & goal_handle)
-{
-    while (std::chrono::steady_clock::now() < deadline)
-    {
-        if (shutting_down_.load() || cancel_requested_.load() ||
-            goal_handle->is_canceling() || !rclcpp::ok())
-        {
-            return false;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
     return true;
 }
@@ -522,9 +516,10 @@ void FollowJointTrajectoryServer::execute(
     {
         initial_positions[joint] = initial.jVal[joint];
     }
-    const auto schedule = build_timed_servo_schedule(
+    const auto schedule = build_queued_servo_schedule(
         trajectory, expected_joint_names_, initial_positions,
-        kJakaServoInterpolationCycle, servo_step_num_, maximum_servo_samples_);
+        kJakaServoInterpolationCycle, maximum_servo_step_num_,
+        maximum_servo_samples_);
     if (!schedule.valid)
     {
         abort_goal(
@@ -533,12 +528,30 @@ void FollowJointTrajectoryServer::execute(
         return;
     }
 
+    int filter_ret;
     int enable_ret;
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
         log_sdk_state_locked("进入 servo mode 前");
-        enable_ret = robot_.servo_move_enable(TRUE);
+        filter_ret = servo_filter_cutoff_hz_ > 0.0 ?
+            robot_.servo_move_use_joint_LPF(servo_filter_cutoff_hz_) :
+            robot_.servo_move_use_none_filter();
+        if (filter_ret != 0)
+        {
+            enable_ret = filter_ret;
+        }
+        else
+        {
+            enable_ret = robot_.servo_move_enable(TRUE);
+        }
         log_sdk_state_locked("进入 servo mode 后");
+    }
+    if (filter_ret != 0)
+    {
+        abort_goal(
+            Action::Result::PATH_TOLERANCE_VIOLATED,
+            "配置 servo 滤波器失败: " + sdk_error(filter_ret));
+        return;
     }
     if (enable_ret != 0)
     {
@@ -549,19 +562,21 @@ void FollowJointTrajectoryServer::execute(
     }
     servo_mode_entered = true;
 
+    const std::string filter_description = servo_filter_cutoff_hz_ > 0.0 ?
+        std::to_string(servo_filter_cutoff_hz_) + " Hz LPF" : "none";
     RCLCPP_INFO(
         node_->get_logger(),
-        "开始定时下发 JAKA servo_j: source_points=%zu, servo_samples=%zu, "
+        "开始连续填充 JAKA servo_j 队列: source_points=%zu, segments=%zu, "
         "planned_duration=%.6f s, scheduled_duration=%.6f s, "
-        "step_num=%u, command_period=%.6f s",
+        "maximum_step_num=%u, filter=%s",
         trajectory.points.size(), schedule.setpoints.size(),
         schedule.planned_duration, schedule.scheduled_duration,
-        servo_step_num_,
-        kJakaServoInterpolationCycle * static_cast<double>(servo_step_num_));
+        maximum_servo_step_num_, filter_description.c_str());
 
-    const auto started_at = std::chrono::steady_clock::now();
-    auto next_feedback_at = started_at;
-    std::size_t consecutive_overruns = 0U;
+    const auto dispatch_started_at = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point controller_started_at;
+    bool controller_started = false;
+    std::size_t consecutive_starvations = 0U;
 
     for (std::size_t sample_index = 0;
         sample_index < schedule.setpoints.size(); ++sample_index)
@@ -569,60 +584,15 @@ void FollowJointTrajectoryServer::execute(
         const auto & setpoint = schedule.setpoints[sample_index];
         if (goal_handle->is_canceling())
         {
-            cancel_goal("定时轨迹下发期间已取消并停止机器人");
+            cancel_goal("servo 队列填充期间已取消并停止机器人");
             return;
         }
         if (shutting_down_.load() || cancel_requested_.load() || !rclcpp::ok())
         {
             abort_goal(
                 Action::Result::PATH_TOLERANCE_VIOLATED,
-                "定时轨迹下发期间被外部停止");
+                "servo 队列填充期间被外部停止");
             return;
-        }
-        const auto command_deadline = started_at +
-            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                std::chrono::duration<double>(setpoint.command_time));
-        if (!wait_until(command_deadline, goal_handle))
-        {
-            if (goal_handle->is_canceling())
-            {
-                cancel_goal("定时轨迹下发期间已取消并停止机器人");
-            }
-            else
-            {
-                abort_goal(
-                    Action::Result::PATH_TOLERANCE_VIOLATED,
-                    "定时轨迹下发期间被外部停止");
-            }
-            return;
-        }
-
-        const auto before_call = std::chrono::steady_clock::now();
-        const double lateness = std::max(
-            0.0,
-            std::chrono::duration<double>(before_call - command_deadline).count());
-        if (update_servo_overrun_state(
-                lateness, maximum_lateness_,
-                maximum_consecutive_overruns_, consecutive_overruns))
-        {
-            std::ostringstream message;
-            message << "servo 调度连续超限，停止发送过期设定点: sample="
-                    << sample_index + 1U << '/' << schedule.setpoints.size()
-                    << ", lateness=" << lateness
-                    << " s, maximum=" << maximum_lateness_
-                    << " s, consecutive=" << consecutive_overruns
-                    << ", allowed=" << maximum_consecutive_overruns_;
-            abort_goal(Action::Result::PATH_TOLERANCE_VIOLATED, message.str());
-            return;
-        }
-        if (lateness > maximum_lateness_)
-        {
-            RCLCPP_WARN(
-                node_->get_logger(),
-                "servo 调度单次超限: sample=%zu/%zu, lateness=%.6f s, "
-                "consecutive=%zu/%zu",
-                sample_index + 1U, schedule.setpoints.size(), lateness,
-                consecutive_overruns, maximum_consecutive_overruns_);
         }
 
         JointValue target{};
@@ -639,85 +609,86 @@ void FollowJointTrajectoryServer::execute(
                 &target, MoveMode::ABS, setpoint.step_num);
         }
         const auto call_finished_at = std::chrono::steady_clock::now();
-        const double call_started_time =
-            std::chrono::duration<double>(call_started_at - started_at).count();
-        const double call_finished_time =
-            std::chrono::duration<double>(call_finished_at - started_at).count();
-        servo_call_timings.push_back({
-            setpoint.command_time, call_started_time, call_finished_time});
-        telemetry.push_back({
-            "command", sample_index + 1U, call_finished_time,
-            setpoint.command_time, call_started_time, call_finished_time,
-            call_finished_time - call_started_time, lateness,
-            setpoint.step_num, setpoint.positions, {}, false,
-            false, false, 0, false, false});
         if (servo_ret != 0)
         {
             abort_goal(
                 Action::Result::PATH_TOLERANCE_VIOLATED,
-                "servo_j 定时下发失败: " + sdk_error(servo_ret));
+                "servo_j 队列填充失败: " + sdk_error(servo_ret));
             return;
         }
-
-        const auto now = call_finished_at;
-        if (now >= next_feedback_at ||
-            sample_index + 1U == schedule.setpoints.size())
+        if (!controller_started)
         {
-            JointValue actual{};
-            int actual_ret;
-            {
-                std::lock_guard<std::mutex> lock(session_mutex_);
-                actual_ret = robot_.get_joint_position(&actual);
-            }
-            if (actual_ret != 0)
-            {
-                abort_goal(
-                    Action::Result::PATH_TOLERANCE_VIOLATED,
-                    "定时轨迹反馈读取失败: joint=" +
-                    std::to_string(actual_ret));
-                return;
-            }
-
-            std::vector<double> actual_positions(expected_joint_names_.size());
-            for (std::size_t joint = 0; joint < actual_positions.size(); ++joint)
-            {
-                actual_positions[joint] = actual.jVal[joint];
-            }
-            const double elapsed =
-                std::chrono::duration<double>(now - started_at).count();
-            telemetry.push_back({
-                "feedback", sample_index + 1U, elapsed,
-                setpoint.command_time, 0.0, 0.0, 0.0, lateness,
-                setpoint.step_num, setpoint.positions, actual_positions, true,
-                false, false, 0, false, false});
-
-            trajectory_msgs::msg::JointTrajectoryPoint desired;
-            desired.positions = reorder_joint_values(
-                expected_joint_names_, setpoint.positions, trajectory.joint_names);
-            desired.time_from_start = static_cast<builtin_interfaces::msg::Duration>(
-                rclcpp::Duration::from_seconds(setpoint.reference_time));
-            publish_feedback(goal_handle, desired, actual, now - started_at);
-            next_feedback_at = now +
-                std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                    std::chrono::duration<double>(feedback_period_));
+            controller_started_at = call_started_at;
+            controller_started = true;
+        }
+        const double call_started_time =
+            std::chrono::duration<double>(
+            call_started_at - dispatch_started_at).count();
+        const double call_finished_time =
+            std::chrono::duration<double>(
+            call_finished_at - dispatch_started_at).count();
+        const double controller_elapsed = std::max(
+            0.0,
+            std::chrono::duration<double>(
+            call_finished_at - controller_started_at).count());
+        const double queue_starvation = sample_index == 0U ? 0.0 : std::max(
+            0.0, controller_elapsed - setpoint.controller_start_time);
+        servo_call_timings.push_back({
+            call_finished_time - call_started_time, queue_starvation});
+        telemetry.push_back({
+            "queue", sample_index + 1U, controller_elapsed,
+            setpoint.controller_start_time,
+            call_started_time, call_finished_time,
+            call_finished_time - call_started_time, queue_starvation,
+            setpoint.step_num, setpoint.positions, {}, false,
+            false, false, 0, false, false});
+        if (update_servo_starvation_state(
+                queue_starvation, maximum_queue_starvation_,
+                maximum_consecutive_starvations_, consecutive_starvations))
+        {
+            std::ostringstream message;
+            message << "servo 控制柜队列连续饥饿: segment="
+                    << sample_index + 1U << '/' << schedule.setpoints.size()
+                    << ", starvation=" << queue_starvation
+                    << " s, maximum=" << maximum_queue_starvation_
+                    << " s, consecutive=" << consecutive_starvations
+                    << ", allowed=" << maximum_consecutive_starvations_;
+            abort_goal(
+                Action::Result::PATH_TOLERANCE_VIOLATED,
+                message.str());
+            return;
+        }
+        if (queue_starvation > maximum_queue_starvation_)
+        {
+            RCLCPP_WARN(
+                node_->get_logger(),
+                "servo 队列单次饥饿: segment=%zu/%zu, starvation=%.6f s, "
+                "consecutive=%zu/%zu",
+                sample_index + 1U, schedule.setpoints.size(), queue_starvation,
+                consecutive_starvations, maximum_consecutive_starvations_);
         }
     }
 
     const auto send_completed_at = std::chrono::steady_clock::now();
     const auto timing_summary = summarize_servo_timing(
-        servo_call_timings, maximum_lateness_);
+        servo_call_timings, maximum_queue_starvation_);
+    const double dispatch_elapsed = std::chrono::duration<double>(
+        send_completed_at - dispatch_started_at).count();
+    const double send_completed_time = std::chrono::duration<double>(
+        send_completed_at - controller_started_at).count();
     RCLCPP_INFO(
         node_->get_logger(),
-        "servo 定时下发完成: sent=%zu, late_samples=%zu, "
-        "max_lateness=%.6f s, call_ms[p50=%.3f p95=%.3f p99=%.3f max=%.3f], "
-        "elapsed=%.6f s",
-        timing_summary.samples, timing_summary.late_samples,
-        timing_summary.maximum_lateness,
+        "servo 队列填充完成: sent=%zu, starved_segments=%zu, "
+        "max_starvation=%.6f s, call_ms[p50=%.3f p95=%.3f p99=%.3f "
+        "max=%.3f], dispatch_elapsed=%.6f s, controller_elapsed=%.6f s, "
+        "queued_duration=%.6f s",
+        timing_summary.samples, timing_summary.starved_samples,
+        timing_summary.maximum_queue_starvation,
         timing_summary.call_duration_p50 * 1000.0,
         timing_summary.call_duration_p95 * 1000.0,
         timing_summary.call_duration_p99 * 1000.0,
         timing_summary.maximum_call_duration * 1000.0,
-        std::chrono::duration<double>(send_completed_at - started_at).count());
+        dispatch_elapsed, send_completed_time, schedule.scheduled_duration);
 
     double allowed_timeout = goal_timeout_;
     const double requested_timeout = duration_seconds(
@@ -726,11 +697,9 @@ void FollowJointTrajectoryServer::execute(
     {
         allowed_timeout = requested_timeout;
     }
-    const auto expected_finish = started_at +
+    const auto expected_finish = controller_started_at +
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             std::chrono::duration<double>(schedule.scheduled_duration));
-    const double send_completed_time =
-        std::chrono::duration<double>(send_completed_at - started_at).count();
     const auto deadline_offset = endpoint_deadline_offset(
         schedule.scheduled_duration, send_completed_time, allowed_timeout);
     if (!deadline_offset)
@@ -740,14 +709,18 @@ void FollowJointTrajectoryServer::execute(
             "终点检查超时参数无效");
         return;
     }
-    const auto deadline = started_at +
+    const auto deadline = controller_started_at +
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             std::chrono::duration<double>(*deadline_offset));
+    RCLCPP_INFO(
+        node_->get_logger(),
+        "终点监控窗口: queue_remaining=%.6f s, goal_timeout=%.6f s, "
+        "deadline_from_controller_start=%.6f s",
+        std::max(0.0, schedule.scheduled_duration - send_completed_time),
+        allowed_timeout, *deadline_offset);
     const auto final_positions = reordered_positions(
         trajectory.joint_names, trajectory.points.back().positions);
-    double last_maximum_error = std::numeric_limits<double>::infinity();
-    std::size_t last_maximum_error_joint = 0;
-    std::vector<double> last_joint_errors(expected_joint_names_.size(), 0.0);
+    EndpointProgress last_progress;
     auto next_terminal_log = std::chrono::steady_clock::now();
     auto next_terminal_telemetry = std::chrono::steady_clock::now();
 
@@ -781,28 +754,44 @@ void FollowJointTrajectoryServer::execute(
             return;
         }
 
-        double maximum_error = 0.0;
-        std::size_t maximum_error_joint = 0;
-        for (std::size_t index = 0; index < final_positions.size(); ++index)
+        std::vector<double> actual_positions(expected_joint_names_.size());
+        for (std::size_t joint = 0; joint < actual_positions.size(); ++joint)
         {
-            const double error = std::abs(
-                final_positions[index] - actual.jVal[index]);
-            last_joint_errors[index] = error;
-            if (error > maximum_error)
-            {
-                maximum_error = error;
-                maximum_error_joint = index;
-            }
+            actual_positions[joint] = actual.jVal[joint];
         }
-        last_maximum_error = maximum_error;
-        last_maximum_error_joint = maximum_error_joint;
-
-        publish_feedback(
-            goal_handle,
-            trajectory.points.back(),
-            actual,
-            std::chrono::steady_clock::now() - started_at);
         const auto now = std::chrono::steady_clock::now();
+        const double controller_elapsed = std::max(
+            0.0,
+            std::chrono::duration<double>(
+            now - controller_started_at).count());
+        const auto desired_positions = sample_queued_servo_schedule(
+            schedule, initial_positions, controller_elapsed);
+        if (!desired_positions)
+        {
+            abort_goal(
+                Action::Result::GOAL_TOLERANCE_VIOLATED,
+                "无法按控制柜时间轴计算期望关节位置");
+            return;
+        }
+        const auto progress = calculate_endpoint_progress(
+            initial_positions, final_positions, actual_positions);
+        if (!progress.valid)
+        {
+            abort_goal(
+                Action::Result::GOAL_TOLERANCE_VIOLATED,
+                "终点进度计算输入无效");
+            return;
+        }
+        last_progress = progress;
+
+        trajectory_msgs::msg::JointTrajectoryPoint desired;
+        desired.positions = reorder_joint_values(
+            expected_joint_names_, *desired_positions, trajectory.joint_names);
+        desired.time_from_start = static_cast<builtin_interfaces::msg::Duration>(
+            rclcpp::Duration::from_seconds(std::min(
+            controller_elapsed, schedule.scheduled_duration)));
+        publish_feedback(
+            goal_handle, desired, actual, now - controller_started_at);
         if (now >= next_terminal_telemetry)
         {
             RobotStatus_simple status{};
@@ -823,16 +812,12 @@ void FollowJointTrajectoryServer::execute(
                     std::to_string(mode_ret));
                 return;
             }
-            std::vector<double> actual_positions(expected_joint_names_.size());
-            for (std::size_t joint = 0; joint < actual_positions.size(); ++joint)
-            {
-                actual_positions[joint] = actual.jVal[joint];
-            }
             telemetry.push_back({
-                "endpoint", schedule.setpoints.size(),
-                std::chrono::duration<double>(now - started_at).count(),
+                now < expected_finish ? "tracking" : "endpoint",
+                schedule.setpoints.size(), controller_elapsed,
                 schedule.scheduled_duration, 0.0, 0.0, 0.0, 0.0,
-                servo_step_num_, final_positions, actual_positions, true,
+                schedule.setpoints.back().step_num,
+                *desired_positions, actual_positions, true,
                 static_cast<bool>(status.powered_on),
                 static_cast<bool>(status.enabled), status.errcode,
                 static_cast<bool>(in_servo), true});
@@ -844,14 +829,23 @@ void FollowJointTrajectoryServer::execute(
         {
             RCLCPP_INFO(
                 node_->get_logger(),
-                "终点收敛: elapsed=%.3f s, max_error=%.9f rad, joint=%s",
-                std::chrono::duration<double>(now - started_at).count(),
-                maximum_error,
-                expected_joint_names_[maximum_error_joint].c_str());
+                "%s: elapsed=%.3f s, wait=%.3f s, "
+                "commanded=%.9f rad, achieved=%.9f rad, completion=%.2f%%, "
+                "max_error=%.9f rad, error_joint=%s",
+                now < expected_finish ? "轨迹跟踪" : "终点收敛",
+                controller_elapsed,
+                std::max(
+                    0.0,
+                    std::chrono::duration<double>(now - expected_finish).count()),
+                progress.maximum_commanded_delta,
+                progress.achieved_delta_on_command_joint,
+                progress.completion_ratio * 100.0,
+                progress.maximum_absolute_error,
+                expected_joint_names_[progress.maximum_error_joint].c_str());
             next_terminal_log = now + std::chrono::seconds(1);
         }
-        if (std::chrono::steady_clock::now() >= expected_finish &&
-            maximum_error <= goal_tolerance_)
+        if (now >= expected_finish &&
+            progress.maximum_absolute_error <= goal_tolerance_)
         {
             const int stop_ret = exit_servo_mode();
             flush_telemetry();
@@ -865,13 +859,22 @@ void FollowJointTrajectoryServer::execute(
             else
             {
                 result->error_code = Action::Result::SUCCESSFUL;
-                result->error_string = "轨迹执行成功";
+                std::ostringstream message;
+                message << "轨迹执行成功: commanded="
+                        << progress.maximum_commanded_delta
+                        << " rad, achieved="
+                        << progress.achieved_delta_on_command_joint
+                        << " rad, completion="
+                        << progress.completion_ratio * 100.0
+                        << "%, max_error="
+                        << progress.maximum_absolute_error << " rad";
+                result->error_string = message.str();
                 goal_handle->succeed(result);
             }
             finish();
             return;
         }
-        if (std::chrono::steady_clock::now() >= deadline)
+        if (now >= deadline)
         {
             break;
         }
@@ -879,21 +882,29 @@ void FollowJointTrajectoryServer::execute(
     }
 
     std::ostringstream error_details;
-    for (std::size_t joint = 0; joint < last_joint_errors.size(); ++joint)
+    for (std::size_t joint = 0;
+        joint < last_progress.absolute_errors.size(); ++joint)
     {
         if (joint > 0U)
         {
             error_details << ", ";
         }
         error_details << expected_joint_names_[joint] << '='
-                      << last_joint_errors[joint];
+                      << last_progress.absolute_errors[joint];
     }
     abort_goal(
         Action::Result::GOAL_TOLERANCE_VIOLATED,
         "最终关节误差在超时前未进入容差: " +
-        expected_joint_names_[last_maximum_error_joint] + " error=" +
-        std::to_string(last_maximum_error) + " rad, tolerance=" +
-        std::to_string(goal_tolerance_) + " rad, all_errors=[" +
+        expected_joint_names_[last_progress.maximum_error_joint] + " error=" +
+        std::to_string(last_progress.maximum_absolute_error) +
+        " rad, tolerance=" + std::to_string(goal_tolerance_) +
+        " rad, commanded=" +
+        std::to_string(last_progress.maximum_commanded_delta) +
+        " rad, achieved=" +
+        std::to_string(last_progress.achieved_delta_on_command_joint) +
+        " rad, completion=" +
+        std::to_string(last_progress.completion_ratio * 100.0) +
+        "%, all_errors=[" +
         error_details.str() + "]");
 }
 
