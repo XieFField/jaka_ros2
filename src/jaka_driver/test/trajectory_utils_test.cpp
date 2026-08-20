@@ -324,6 +324,29 @@ TEST(TrajectoryUtilsTest, EndpointTimeoutStartsAfterLaterFinishEvent)
         1.416, 3.836, 0.0).has_value());
 }
 
+TEST(TrajectoryUtilsTest, ConfiguredEndpointMarginCannotBeShortenedByGoal)
+{
+    const auto shorter_request = jaka_driver::effective_endpoint_margin(15.0, 2.0);
+    ASSERT_TRUE(shorter_request.has_value());
+    EXPECT_DOUBLE_EQ(*shorter_request, 15.0);
+
+    const auto longer_request = jaka_driver::effective_endpoint_margin(15.0, 20.0);
+    ASSERT_TRUE(longer_request.has_value());
+    EXPECT_DOUBLE_EQ(*longer_request, 20.0);
+
+    EXPECT_FALSE(jaka_driver::effective_endpoint_margin(0.0, 2.0).has_value());
+    EXPECT_FALSE(jaka_driver::effective_endpoint_margin(15.0, -1.0).has_value());
+}
+
+TEST(TrajectoryUtilsTest, EndpointDeadlineAddsConfiguredConvergenceMargin)
+{
+    const auto deadline = jaka_driver::endpoint_deadline_offset(
+        8.488, 1.131, 15.0);
+
+    ASSERT_TRUE(deadline.has_value());
+    EXPECT_NEAR(*deadline, 23.488, 1e-12);
+}
+
 TEST(TrajectoryUtilsTest, CalculatesEndpointProgressOnLargestCommandedJoint)
 {
     const auto progress = jaka_driver::calculate_endpoint_progress(

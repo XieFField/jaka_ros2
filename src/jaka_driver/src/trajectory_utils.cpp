@@ -433,6 +433,18 @@ bool update_servo_starvation_state(
     return consecutive_starvations > maximum_consecutive_starvations;
 }
 
+std::optional<double> effective_endpoint_margin(
+    double configured_minimum,
+    double requested_margin)
+{
+    if (!std::isfinite(configured_minimum) || configured_minimum <= 0.0 ||
+        !std::isfinite(requested_margin) || requested_margin < 0.0)
+    {
+        return std::nullopt;
+    }
+    return std::max(configured_minimum, requested_margin);
+}
+
 std::optional<double> endpoint_deadline_offset(
     double scheduled_duration,
     double send_completed_time,

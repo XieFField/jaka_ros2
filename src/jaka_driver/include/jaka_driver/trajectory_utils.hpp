@@ -113,6 +113,12 @@ bool update_servo_starvation_state(
     std::size_t maximum_consecutive_starvations,
     std::size_t & consecutive_starvations);
 
+std::optional<double> effective_endpoint_margin(
+    double configured_minimum,
+    double requested_margin);
+
+// The deadline is the later of the scheduled controller finish and the final
+// queue call, plus the configured endpoint convergence margin.
 std::optional<double> endpoint_deadline_offset(
     double scheduled_duration,
     double send_completed_time,

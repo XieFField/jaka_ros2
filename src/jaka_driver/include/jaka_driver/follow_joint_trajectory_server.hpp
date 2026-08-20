@@ -76,7 +76,8 @@ private:
         "joint_1", "joint_2", "joint_3",
         "joint_4", "joint_5", "joint_6"};
     double goal_tolerance_{0.002};
-    double goal_timeout_{2.0};
+    // Additional endpoint convergence time after the queued trajectory duration.
+    double goal_timeout_{15.0};
     unsigned int maximum_servo_step_num_{50U};
     std::size_t maximum_servo_samples_{50000U};
     double maximum_trajectory_duration_{300.0};

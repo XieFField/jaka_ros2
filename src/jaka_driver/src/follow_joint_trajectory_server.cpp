@@ -228,7 +228,7 @@ FollowJointTrajectoryServer::FollowJointTrajectoryServer(
     RCLCPP_INFO(
         node_->get_logger(),
         "JAKA trajectory Action ready: %s, goal_tolerance=%.6f rad, "
-        "goal_timeout=%.3f s, maximum_step_num=%u, servo_filter=%.3f Hz, "
+        "endpoint_margin=%.3f s, maximum_step_num=%u, servo_filter=%.3f Hz, "
         "maximum_queue_starvation=%.3f s, allowed_consecutive_starvations=%zu",
         action_name.c_str(), goal_tolerance_, goal_timeout_,
         maximum_servo_step_num_, servo_filter_cutoff_hz_,
@@ -450,6 +450,11 @@ void FollowJointTrajectoryServer::execute(
     const std::string telemetry_path = make_telemetry_path();
     bool telemetry_written = false;
     bool servo_mode_entered = false;
+    std::size_t terminal_sample_index = 0U;
+    double terminal_elapsed = 0.0;
+    double terminal_controller_segment_start = 0.0;
+    unsigned int terminal_step_num = 0U;
+    std::vector<double> terminal_desired;
     const auto flush_telemetry = [&]() {
         if (telemetry_written)
         {
@@ -469,6 +474,47 @@ void FollowJointTrajectoryServer::execute(
                 telemetry_path.c_str());
         }
     };
+    const auto append_terminal_snapshot = [&](const std::string & phase) {
+        JointValue actual{};
+        RobotStatus_simple status{};
+        BOOL in_servo = FALSE;
+        int actual_ret;
+        int status_ret;
+        int mode_ret;
+        {
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            actual_ret = robot_.get_joint_position(&actual);
+            status_ret = robot_.get_robot_status_simple(&status);
+            mode_ret = robot_.is_in_servomove(&in_servo);
+        }
+
+        std::vector<double> actual_positions;
+        if (actual_ret == 0)
+        {
+            actual_positions.resize(expected_joint_names_.size());
+            for (std::size_t joint = 0; joint < actual_positions.size(); ++joint)
+            {
+                actual_positions[joint] = actual.jVal[joint];
+            }
+        }
+        const bool status_valid = status_ret == 0 && mode_ret == 0;
+        telemetry.push_back({
+            phase, terminal_sample_index, terminal_elapsed,
+            terminal_controller_segment_start,
+            0.0, 0.0, 0.0, 0.0, terminal_step_num,
+            terminal_desired, actual_positions, actual_ret == 0,
+            status_valid && static_cast<bool>(status.powered_on),
+            status_valid && static_cast<bool>(status.enabled),
+            status_valid ? status.errcode : 0,
+            status_valid && static_cast<bool>(in_servo), status_valid});
+        if (actual_ret != 0 || !status_valid)
+        {
+            RCLCPP_WARN(
+                node_->get_logger(),
+                "终态遥测读取不完整: phase=%s, joint=%d, status=%d, servo=%d",
+                phase.c_str(), actual_ret, status_ret, mode_ret);
+        }
+    };
     const auto finish = [this]() {
         release_control(control_owner_, ControlOwner::kTrajectory);
         goal_active_.store(false);
@@ -478,6 +524,7 @@ void FollowJointTrajectoryServer::execute(
         {
             abort_motion_and_exit_servo();
         }
+        append_terminal_snapshot("aborted");
         flush_telemetry();
         result->error_code = code;
         result->error_string = message;
@@ -489,6 +536,7 @@ void FollowJointTrajectoryServer::execute(
         {
             abort_motion_and_exit_servo();
         }
+        append_terminal_snapshot("canceled");
         flush_telemetry();
         result->error_code = Action::Result::SUCCESSFUL;
         result->error_string = message;
@@ -633,6 +681,11 @@ void FollowJointTrajectoryServer::execute(
             call_finished_at - controller_started_at).count());
         const double queue_starvation = sample_index == 0U ? 0.0 : std::max(
             0.0, controller_elapsed - setpoint.controller_start_time);
+        terminal_sample_index = sample_index + 1U;
+        terminal_elapsed = controller_elapsed;
+        terminal_controller_segment_start = setpoint.controller_start_time;
+        terminal_step_num = setpoint.step_num;
+        terminal_desired = setpoint.positions;
         servo_call_timings.push_back({
             call_finished_time - call_started_time, queue_starvation});
         telemetry.push_back({
@@ -690,18 +743,22 @@ void FollowJointTrajectoryServer::execute(
         timing_summary.maximum_call_duration * 1000.0,
         dispatch_elapsed, send_completed_time, schedule.scheduled_duration);
 
-    double allowed_timeout = goal_timeout_;
     const double requested_timeout = duration_seconds(
         goal_handle->get_goal()->goal_time_tolerance);
-    if (requested_timeout > 0.0)
+    const auto allowed_timeout = effective_endpoint_margin(
+        goal_timeout_, requested_timeout);
+    if (!allowed_timeout)
     {
-        allowed_timeout = requested_timeout;
+        abort_goal(
+            Action::Result::INVALID_GOAL,
+            "终点收敛余量参数无效");
+        return;
     }
     const auto expected_finish = controller_started_at +
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             std::chrono::duration<double>(schedule.scheduled_duration));
     const auto deadline_offset = endpoint_deadline_offset(
-        schedule.scheduled_duration, send_completed_time, allowed_timeout);
+        schedule.scheduled_duration, send_completed_time, *allowed_timeout);
     if (!deadline_offset)
     {
         abort_goal(
@@ -714,10 +771,11 @@ void FollowJointTrajectoryServer::execute(
             std::chrono::duration<double>(*deadline_offset));
     RCLCPP_INFO(
         node_->get_logger(),
-        "终点监控窗口: queue_remaining=%.6f s, goal_timeout=%.6f s, "
+        "终点监控窗口: queue_remaining=%.6f s, configured_margin=%.6f s, "
+        "requested_margin=%.6f s, effective_margin=%.6f s, "
         "deadline_from_controller_start=%.6f s",
         std::max(0.0, schedule.scheduled_duration - send_completed_time),
-        allowed_timeout, *deadline_offset);
+        goal_timeout_, requested_timeout, *allowed_timeout, *deadline_offset);
     const auto final_positions = reordered_positions(
         trajectory.joint_names, trajectory.points.back().positions);
     EndpointProgress last_progress;
@@ -783,6 +841,11 @@ void FollowJointTrajectoryServer::execute(
             return;
         }
         last_progress = progress;
+        terminal_sample_index = schedule.setpoints.size();
+        terminal_elapsed = controller_elapsed;
+        terminal_controller_segment_start = schedule.scheduled_duration;
+        terminal_step_num = schedule.setpoints.back().step_num;
+        terminal_desired = *desired_positions;
 
         trajectory_msgs::msg::JointTrajectoryPoint desired;
         desired.positions = reorder_joint_values(
@@ -848,6 +911,9 @@ void FollowJointTrajectoryServer::execute(
             progress.maximum_absolute_error <= goal_tolerance_)
         {
             const int stop_ret = exit_servo_mode();
+            terminal_desired = final_positions;
+            append_terminal_snapshot(
+                stop_ret == 0 ? "succeeded" : "exit_failed");
             flush_telemetry();
             if (stop_ret != 0)
             {
