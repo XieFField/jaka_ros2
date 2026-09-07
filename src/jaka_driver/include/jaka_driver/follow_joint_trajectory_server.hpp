@@ -84,6 +84,7 @@ private:
     double maximum_trajectory_duration_{300.0};
     double feedback_period_{0.1};
     bool capture_sdk_joint_velocity_{false};
+    double sdk_joint_velocity_period_{1.0};
     double servo_filter_cutoff_hz_{0.5};
     double maximum_queue_starvation_{0.008};
     std::size_t maximum_consecutive_starvations_{1U};

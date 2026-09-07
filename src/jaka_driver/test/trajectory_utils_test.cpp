@@ -432,6 +432,21 @@ TEST(TrajectoryUtilsTest, EstimatesJointVelocityFromRawPositionSamples)
         {0.0}, {0.1}, 0.0).has_value());
 }
 
+TEST(TrajectoryUtilsTest, EstimatesNegativeVelocityWithNonuniformPeriod)
+{
+    const auto short_period = jaka_driver::estimate_joint_velocity(
+        {1.0, 2.0}, {0.9998, 2.0}, 0.02);
+    const auto long_period = jaka_driver::estimate_joint_velocity(
+        {1.0, 2.0}, {0.996, 2.0}, 0.4);
+
+    ASSERT_TRUE(short_period.has_value());
+    ASSERT_TRUE(long_period.has_value());
+    EXPECT_NEAR((*short_period)[0], -0.01, 1e-12);
+    EXPECT_NEAR((*long_period)[0], -0.01, 1e-12);
+    EXPECT_DOUBLE_EQ((*short_period)[1], 0.0);
+    EXPECT_DOUBLE_EQ((*long_period)[1], 0.0);
+}
+
 TEST(TrajectoryUtilsTest, SummarizesServoCallTiming)
 {
     const std::vector<jaka_driver::ServoCallTiming> calls{

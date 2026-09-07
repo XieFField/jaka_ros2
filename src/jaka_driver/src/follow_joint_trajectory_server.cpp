@@ -51,9 +51,11 @@ struct TrackingSample
     double actual_sample_period{0.0};
     std::vector<double> commanded_velocity;
     std::vector<double> estimated_actual_velocity;
-    std::vector<double> sdk_actual_velocity;
+    std::vector<double> sdk_inst_velocity_raw;
     bool estimated_velocity_valid{false};
     bool sdk_velocity_valid{false};
+    double sdk_velocity_sample_elapsed{0.0};
+    double sdk_status_call_duration{0.0};
 };
 
 long long artifact_stamp()
@@ -106,10 +108,11 @@ bool write_tracking_csv(
     }
     for (std::size_t joint = 0; joint < 6U; ++joint)
     {
-        stream << ",sdk_actual_velocity_joint_" << joint + 1U;
+        stream << ",sdk_inst_velocity_raw_joint_" << joint + 1U;
     }
     stream << ",estimated_velocity_valid,sdk_velocity_valid,filter_type,"
-              "filter_cutoff_hz,foresight_verified\n";
+              "filter_cutoff_hz,foresight_verified,"
+              "sdk_velocity_sample_elapsed_s,sdk_status_call_duration_s\n";
     stream << std::setprecision(12);
     for (const auto & sample : samples)
     {
@@ -186,12 +189,14 @@ bool write_tracking_csv(
             };
         write_values(sample.commanded_velocity);
         write_values(sample.estimated_actual_velocity);
-        write_values(sample.sdk_actual_velocity);
+        write_values(sample.sdk_inst_velocity_raw);
         stream << ',' << sample.estimated_velocity_valid
                << ',' << sample.sdk_velocity_valid
                << ',' << (servo_filter_cutoff_hz > 0.0 ? "joint_lpf" : "none")
                << ',' << servo_filter_cutoff_hz
-               << ",0\n";
+               << ",0"
+               << ',' << sample.sdk_velocity_sample_elapsed
+               << ',' << sample.sdk_status_call_duration << '\n';
     }
     return stream.good();
 }
@@ -229,6 +234,9 @@ FollowJointTrajectoryServer::FollowJointTrajectoryServer(
     capture_sdk_joint_velocity_ = node_->declare_parameter<bool>(
         "trajectory_capture_sdk_joint_velocity",
         capture_sdk_joint_velocity_);
+    sdk_joint_velocity_period_ = node_->declare_parameter<double>(
+        "trajectory_sdk_joint_velocity_period",
+        sdk_joint_velocity_period_);
     servo_filter_cutoff_hz_ = node_->declare_parameter<double>(
         "trajectory_servo_filter_cutoff_hz", servo_filter_cutoff_hz_);
     maximum_queue_starvation_ = node_->declare_parameter<double>(
@@ -247,6 +255,8 @@ FollowJointTrajectoryServer::FollowJointTrajectoryServer(
         maximum_servo_step_num > static_cast<int64_t>(kMaximumServoStepNum) ||
         maximum_servo_samples <= 0 || maximum_consecutive_starvations < 0 ||
         !std::isfinite(feedback_period_) || feedback_period_ <= 0.0 ||
+        !std::isfinite(sdk_joint_velocity_period_) ||
+        sdk_joint_velocity_period_ <= 0.0 ||
         !std::isfinite(servo_filter_cutoff_hz_) ||
         servo_filter_cutoff_hz_ < 0.0 ||
         !std::isfinite(maximum_queue_starvation_) ||
@@ -283,11 +293,12 @@ FollowJointTrajectoryServer::FollowJointTrajectoryServer(
         "start_tolerance=%.6f rad, "
         "endpoint_margin=%.3f s, maximum_step_num=%u, servo_filter=%.3f Hz, "
         "maximum_queue_starvation=%.3f s, allowed_consecutive_starvations=%zu, "
-        "sdk_joint_velocity=%s",
+        "sdk_joint_velocity=%s, sdk_velocity_period=%.3f s",
         action_name.c_str(), goal_tolerance_, start_tolerance_, goal_timeout_,
         maximum_servo_step_num_, servo_filter_cutoff_hz_,
         maximum_queue_starvation_, maximum_consecutive_starvations_,
-        capture_sdk_joint_velocity_ ? "enabled" : "disabled");
+        capture_sdk_joint_velocity_ ? "enabled" : "disabled",
+        sdk_joint_velocity_period_);
 }
 
 FollowJointTrajectoryServer::~FollowJointTrajectoryServer()
@@ -910,12 +921,24 @@ void FollowJointTrajectoryServer::execute(
     EndpointProgress last_progress;
     auto next_terminal_log = std::chrono::steady_clock::now();
     auto next_terminal_telemetry = std::chrono::steady_clock::now();
-    std::vector<double> previous_actual_positions = initial_positions;
-    auto previous_actual_time = controller_started_at;
+    auto next_sdk_velocity_sample = controller_started_at +
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(sdk_joint_velocity_period_));
+    std::vector<double> previous_actual_positions;
+    std::chrono::steady_clock::time_point previous_actual_time{};
+    bool previous_actual_sample_valid = false;
     std::size_t actual_velocity_samples = 0U;
     double minimum_actual_sample_period =
         std::numeric_limits<double>::infinity();
     double maximum_actual_sample_period = 0.0;
+    std::size_t sdk_velocity_samples = 0U;
+    double minimum_sdk_status_call_duration =
+        std::numeric_limits<double>::infinity();
+    double maximum_sdk_status_call_duration = 0.0;
+    std::size_t estimated_joint1_positive_samples = 0U;
+    std::size_t estimated_joint1_negative_samples = 0U;
+    std::size_t sdk_joint1_positive_samples = 0U;
+    std::size_t sdk_joint1_negative_samples = 0U;
 
     while (true)
     {
@@ -934,28 +957,10 @@ void FollowJointTrajectoryServer::execute(
         }
 
         JointValue actual{};
-        RobotStatus full_status{};
-        bool full_status_valid = false;
         int ret;
         {
             std::lock_guard<std::mutex> lock(session_mutex_);
-            if (capture_sdk_joint_velocity_)
-            {
-                ret = robot_.get_robot_status(&full_status);
-                if (ret == 0)
-                {
-                    full_status_valid = true;
-                    for (std::size_t joint = 0U;
-                        joint < expected_joint_names_.size(); ++joint)
-                    {
-                        actual.jVal[joint] = full_status.joint_position[joint];
-                    }
-                }
-            }
-            else
-            {
-                ret = robot_.get_joint_position(&actual);
-            }
+            ret = robot_.get_joint_position(&actual);
         }
         if (ret != 0)
         {
@@ -975,10 +980,13 @@ void FollowJointTrajectoryServer::execute(
             0.0,
             std::chrono::duration<double>(
             now - controller_started_at).count());
-        const double actual_sample_period = std::chrono::duration<double>(
-            now - previous_actual_time).count();
-        const auto estimated_velocity = estimate_joint_velocity(
-            previous_actual_positions, actual_positions, actual_sample_period);
+        const double actual_sample_period = previous_actual_sample_valid ?
+            std::chrono::duration<double>(
+            now - previous_actual_time).count() : 0.0;
+        const auto estimated_velocity = previous_actual_sample_valid ?
+            estimate_joint_velocity(
+            previous_actual_positions, actual_positions, actual_sample_period) :
+            std::nullopt;
         std::vector<double> estimated_actual_velocity;
         const bool estimated_velocity_valid = estimated_velocity.has_value();
         if (estimated_velocity_valid)
@@ -992,21 +1000,7 @@ void FollowJointTrajectoryServer::execute(
         }
         previous_actual_positions = actual_positions;
         previous_actual_time = now;
-        std::vector<double> sdk_actual_velocity;
-        bool sdk_velocity_valid = false;
-        if (full_status_valid)
-        {
-            sdk_actual_velocity.resize(expected_joint_names_.size());
-            sdk_velocity_valid = true;
-            for (std::size_t joint = 0U;
-                joint < expected_joint_names_.size(); ++joint)
-            {
-                sdk_actual_velocity[joint] =
-                    full_status.robot_monitor_data.jointMonitorData[joint].instVel;
-                sdk_velocity_valid = sdk_velocity_valid &&
-                    std::isfinite(sdk_actual_velocity[joint]);
-            }
-        }
+        previous_actual_sample_valid = true;
         const auto desired_positions = sample_queued_servo_schedule(
             schedule, initial_positions, controller_elapsed);
         const auto commanded_velocity = sample_queued_servo_velocity(
@@ -1017,6 +1011,22 @@ void FollowJointTrajectoryServer::execute(
                 Action::Result::GOAL_TOLERANCE_VIOLATED,
                 "无法按控制柜时间轴计算期望关节位置");
             return;
+        }
+        constexpr double kVelocitySignDeadband = 1e-6;
+        const bool joint1_command_active =
+            !commanded_velocity->empty() &&
+            std::abs(commanded_velocity->front()) > kVelocitySignDeadband;
+        if (joint1_command_active && estimated_velocity_valid &&
+            !estimated_actual_velocity.empty())
+        {
+            if (estimated_actual_velocity.front() > kVelocitySignDeadband)
+            {
+                ++estimated_joint1_positive_samples;
+            }
+            else if (estimated_actual_velocity.front() < -kVelocitySignDeadband)
+            {
+                ++estimated_joint1_negative_samples;
+            }
         }
         const auto progress = calculate_endpoint_progress(
             initial_positions, final_positions, actual_positions);
@@ -1044,6 +1054,75 @@ void FollowJointTrajectoryServer::execute(
             goal_handle, desired, actual, now - controller_started_at);
         if (now >= next_terminal_telemetry)
         {
+            RobotStatus full_status{};
+            bool full_status_valid = false;
+            std::vector<double> sdk_inst_velocity_raw;
+            bool sdk_velocity_valid = false;
+            double sdk_velocity_sample_elapsed = 0.0;
+            double sdk_status_call_duration = 0.0;
+            if (capture_sdk_joint_velocity_ &&
+                now >= next_sdk_velocity_sample)
+            {
+                const auto sdk_call_started_at = std::chrono::steady_clock::now();
+                int sdk_status_ret;
+                {
+                    std::lock_guard<std::mutex> lock(session_mutex_);
+                    sdk_status_ret = robot_.get_robot_status(&full_status);
+                }
+                const auto sdk_call_finished_at = std::chrono::steady_clock::now();
+                sdk_status_call_duration = std::chrono::duration<double>(
+                    sdk_call_finished_at - sdk_call_started_at).count();
+                sdk_velocity_sample_elapsed = std::chrono::duration<double>(
+                    sdk_call_finished_at - controller_started_at).count();
+                next_sdk_velocity_sample = sdk_call_finished_at +
+                    std::chrono::duration_cast<
+                    std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(
+                    sdk_joint_velocity_period_));
+                if (sdk_status_ret == 0)
+                {
+                    full_status_valid = true;
+                    sdk_inst_velocity_raw.resize(expected_joint_names_.size());
+                    sdk_velocity_valid = true;
+                    for (std::size_t joint = 0U;
+                        joint < expected_joint_names_.size(); ++joint)
+                    {
+                        sdk_inst_velocity_raw[joint] = full_status.
+                            robot_monitor_data.jointMonitorData[joint].instVel;
+                        sdk_velocity_valid = sdk_velocity_valid &&
+                            std::isfinite(sdk_inst_velocity_raw[joint]);
+                    }
+                    if (sdk_velocity_valid)
+                    {
+                        ++sdk_velocity_samples;
+                        minimum_sdk_status_call_duration = std::min(
+                            minimum_sdk_status_call_duration,
+                            sdk_status_call_duration);
+                        maximum_sdk_status_call_duration = std::max(
+                            maximum_sdk_status_call_duration,
+                            sdk_status_call_duration);
+                        if (joint1_command_active &&
+                            sdk_inst_velocity_raw.front() >
+                            kVelocitySignDeadband)
+                        {
+                            ++sdk_joint1_positive_samples;
+                        }
+                        else if (joint1_command_active &&
+                            sdk_inst_velocity_raw.front() <
+                            -kVelocitySignDeadband)
+                        {
+                            ++sdk_joint1_negative_samples;
+                        }
+                    }
+                }
+                else
+                {
+                    RCLCPP_WARN(
+                        node_->get_logger(),
+                        "SDK instVel 辅助采样失败: %s；继续使用位置差分速度",
+                        sdk_error(sdk_status_ret).c_str());
+                }
+            }
             RobotStatus_simple status{};
             BOOL in_servo = FALSE;
             int status_ret = 0;
@@ -1081,8 +1160,9 @@ void FollowJointTrajectoryServer::execute(
                 static_cast<bool>(status.enabled), status.errcode,
                 static_cast<bool>(in_servo), true,
                 actual_sample_period, *commanded_velocity,
-                estimated_actual_velocity, sdk_actual_velocity,
-                estimated_velocity_valid, sdk_velocity_valid});
+                estimated_actual_velocity, sdk_inst_velocity_raw,
+                estimated_velocity_valid, sdk_velocity_valid,
+                sdk_velocity_sample_elapsed, sdk_status_call_duration});
             next_terminal_telemetry = now +
                 std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                     std::chrono::duration<double>(feedback_period_));
@@ -1111,12 +1191,24 @@ void FollowJointTrajectoryServer::execute(
         {
             RCLCPP_INFO(
                 node_->get_logger(),
-                "关节速度遥测: samples=%zu, sample_period[min=%.6f max=%.6f] s, "
-                "sdk_velocity=%s",
+                "关节速度遥测: position_samples=%zu, "
+                "sample_period[min=%.6f max=%.6f] s, "
+                "sdk_velocity=%s, sdk_samples=%zu, sdk_period=%.3f s, "
+                "sdk_call_ms[min=%.3f max=%.3f], "
+                "joint_1_sign[estimated_positive=%zu estimated_negative=%zu "
+                "sdk_raw_positive=%zu sdk_raw_negative=%zu]",
                 actual_velocity_samples,
                 actual_velocity_samples > 0U ? minimum_actual_sample_period : 0.0,
                 maximum_actual_sample_period,
-                capture_sdk_joint_velocity_ ? "requested" : "disabled");
+                capture_sdk_joint_velocity_ ? "requested" : "disabled",
+                sdk_velocity_samples, sdk_joint_velocity_period_,
+                sdk_velocity_samples > 0U ?
+                minimum_sdk_status_call_duration * 1000.0 : 0.0,
+                maximum_sdk_status_call_duration * 1000.0,
+                estimated_joint1_positive_samples,
+                estimated_joint1_negative_samples,
+                sdk_joint1_positive_samples,
+                sdk_joint1_negative_samples);
             const int stop_ret = exit_servo_mode();
             terminal_desired = final_positions;
             append_terminal_snapshot(
