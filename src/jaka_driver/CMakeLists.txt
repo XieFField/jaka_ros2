@@ -42,6 +42,9 @@ add_executable(trajectory_adapter_diagnostic
   src/trajectory_adapter_diagnostic.cpp
   src/trajectory_utils.cpp
 )
+add_executable(fixed_joint1_negative_goal
+  src/fixed_joint1_negative_goal.cpp
+)
 
 # Link libraries
 ament_target_dependencies(jaka_driver
@@ -82,6 +85,14 @@ ament_target_dependencies(servoj_demo
   action_msgs
 )
 ament_target_dependencies(trajectory_adapter_diagnostic trajectory_msgs)
+ament_target_dependencies(fixed_joint1_negative_goal
+  rclcpp
+  rclcpp_action
+  sensor_msgs
+  jaka_msgs
+  control_msgs
+  trajectory_msgs
+)
 
 # For including directories in ROS 2
 target_include_directories(jaka_driver
@@ -138,6 +149,7 @@ install(TARGETS
   client
   servoj_demo
   trajectory_adapter_diagnostic
+  fixed_joint1_negative_goal
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -406,6 +406,30 @@ TEST(TrajectoryUtilsTest, SamplesControllerQueueTimeline)
     EXPECT_DOUBLE_EQ(finished->front(), 1.0);
     EXPECT_FALSE(jaka_driver::sample_queued_servo_schedule(
         schedule, {}, 0.5).has_value());
+
+    const auto active_velocity = jaka_driver::sample_queued_servo_velocity(
+        schedule, 0.25);
+    ASSERT_TRUE(active_velocity.has_value());
+    EXPECT_DOUBLE_EQ(active_velocity->front(), 1.0);
+    const auto stopped_velocity = jaka_driver::sample_queued_servo_velocity(
+        schedule, 2.0);
+    ASSERT_TRUE(stopped_velocity.has_value());
+    EXPECT_DOUBLE_EQ(stopped_velocity->front(), 0.0);
+}
+
+TEST(TrajectoryUtilsTest, EstimatesJointVelocityFromRawPositionSamples)
+{
+    const auto velocity = jaka_driver::estimate_joint_velocity(
+        {1.0, -2.0}, {0.99, -1.98}, 0.02);
+    ASSERT_TRUE(velocity.has_value());
+    ASSERT_EQ(velocity->size(), 2U);
+    EXPECT_NEAR((*velocity)[0], -0.5, 1e-12);
+    EXPECT_NEAR((*velocity)[1], 1.0, 1e-12);
+
+    EXPECT_FALSE(jaka_driver::estimate_joint_velocity(
+        {0.0}, {0.0, 1.0}, 0.02).has_value());
+    EXPECT_FALSE(jaka_driver::estimate_joint_velocity(
+        {0.0}, {0.1}, 0.0).has_value());
 }
 
 TEST(TrajectoryUtilsTest, SummarizesServoCallTiming)

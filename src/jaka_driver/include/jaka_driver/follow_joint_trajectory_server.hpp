@@ -83,6 +83,7 @@ private:
     std::size_t maximum_servo_samples_{50000U};
     double maximum_trajectory_duration_{300.0};
     double feedback_period_{0.1};
+    bool capture_sdk_joint_velocity_{false};
     double servo_filter_cutoff_hz_{0.5};
     double maximum_queue_starvation_{0.008};
     std::size_t maximum_consecutive_starvations_{1U};

@@ -144,6 +144,15 @@ std::optional<std::vector<double>> sample_queued_servo_schedule(
     const std::vector<double> & initial_positions,
     double controller_elapsed);
 
+std::optional<std::vector<double>> sample_queued_servo_velocity(
+    const QueuedServoSchedule & schedule,
+    double controller_elapsed);
+
+std::optional<std::vector<double>> estimate_joint_velocity(
+    const std::vector<double> & previous_positions,
+    const std::vector<double> & current_positions,
+    double sample_period);
+
 ServoTimingSummary summarize_servo_timing(
     const std::vector<ServoCallTiming> & calls,
     double starvation_threshold);

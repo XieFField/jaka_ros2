@@ -650,6 +650,50 @@ std::optional<std::vector<double>> sample_queued_servo_schedule(
     return schedule.setpoints.back().positions;
 }
 
+std::optional<std::vector<double>> sample_queued_servo_velocity(
+    const QueuedServoSchedule & schedule,
+    double controller_elapsed)
+{
+    if (!schedule.valid || schedule.setpoints.empty() ||
+        !std::isfinite(controller_elapsed) || controller_elapsed < 0.0)
+    {
+        return std::nullopt;
+    }
+    for (const auto & setpoint : schedule.setpoints)
+    {
+        if (controller_elapsed <= setpoint.controller_finish_time)
+        {
+            return finite_values(setpoint.implicit_velocities) ?
+                std::optional<std::vector<double>>(
+                setpoint.implicit_velocities) : std::nullopt;
+        }
+    }
+    return std::vector<double>(
+        schedule.setpoints.back().positions.size(), 0.0);
+}
+
+std::optional<std::vector<double>> estimate_joint_velocity(
+    const std::vector<double> & previous_positions,
+    const std::vector<double> & current_positions,
+    double sample_period)
+{
+    if (previous_positions.empty() ||
+        previous_positions.size() != current_positions.size() ||
+        !finite_values(previous_positions) || !finite_values(current_positions) ||
+        !std::isfinite(sample_period) || sample_period <= 0.0)
+    {
+        return std::nullopt;
+    }
+    std::vector<double> velocity(previous_positions.size());
+    for (std::size_t joint = 0U; joint < velocity.size(); ++joint)
+    {
+        velocity[joint] =
+            (current_positions[joint] - previous_positions[joint]) /
+            sample_period;
+    }
+    return velocity;
+}
+
 namespace
 {
 
