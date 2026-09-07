@@ -38,6 +38,10 @@ add_executable(jaka_driver
 add_executable(sdk_test src/sdk_test.cpp)
 add_executable(client src/client.cpp)
 add_executable(servoj_demo src/servoj_demo.cpp)
+add_executable(trajectory_adapter_diagnostic
+  src/trajectory_adapter_diagnostic.cpp
+  src/trajectory_utils.cpp
+)
 
 # Link libraries
 ament_target_dependencies(jaka_driver
@@ -77,6 +81,7 @@ ament_target_dependencies(servoj_demo
   jaka_msgs
   action_msgs
 )
+ament_target_dependencies(trajectory_adapter_diagnostic trajectory_msgs)
 
 # For including directories in ROS 2
 target_include_directories(jaka_driver
@@ -107,6 +112,11 @@ target_include_directories(servoj_demo
     ${ament_INCLUDE_DIRS}
 )
 
+target_include_directories(trajectory_adapter_diagnostic
+  PUBLIC
+    include
+)
+
 
 
 # Specify where to find external libraries
@@ -127,6 +137,7 @@ install(TARGETS
   sdk_test
   client
   servoj_demo
+  trajectory_adapter_diagnostic
   DESTINATION lib/${PROJECT_NAME}
 )
 

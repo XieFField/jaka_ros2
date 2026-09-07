@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -23,6 +24,26 @@ trajectory_msgs::msg::JointTrajectory valid_trajectory()
     point.positions = {0.0, 0.1, 0.2, 0.3, 0.4, 0.5};
     point.time_from_start.sec = 1;
     trajectory.points.push_back(point);
+    return trajectory;
+}
+
+trajectory_msgs::msg::JointTrajectory dense_negative_trajectory(
+    std::size_t intervals,
+    double interval_seconds)
+{
+    trajectory_msgs::msg::JointTrajectory trajectory;
+    trajectory.joint_names = kExpectedJoints;
+    for (std::size_t index = 0U; index <= intervals; ++index)
+    {
+        trajectory_msgs::msg::JointTrajectoryPoint point;
+        point.positions.assign(kExpectedJoints.size(), 0.0);
+        point.positions[0] = -0.001 * static_cast<double>(index);
+        const double seconds = interval_seconds * static_cast<double>(index);
+        point.time_from_start.sec = static_cast<int32_t>(std::floor(seconds));
+        point.time_from_start.nanosec = static_cast<uint32_t>(std::llround(
+            (seconds - std::floor(seconds)) * 1e9));
+        trajectory.points.push_back(std::move(point));
+    }
     return trajectory;
 }
 
@@ -196,6 +217,33 @@ TEST(TrajectoryUtilsTest, QueueRoundsDurationAndEndsAtExactTarget)
         trajectory.points.front().positions);
 }
 
+TEST(TrajectoryUtilsTest, QueueQuantizesAgainstAbsoluteTimelineWithoutDrift)
+{
+    const auto trajectory = dense_negative_trajectory(10U, 0.009);
+    const auto schedule = jaka_driver::build_queued_servo_schedule(
+        trajectory, kExpectedJoints, std::vector<double>(6, 0.0),
+        jaka_driver::kJakaServoInterpolationCycle, 50U, 100U);
+
+    ASSERT_TRUE(schedule.valid) << schedule.error;
+    EXPECT_NEAR(schedule.planned_duration, 0.090, 1e-12);
+    EXPECT_NEAR(schedule.scheduled_duration, 0.096, 1e-12);
+    EXPECT_LT(
+        schedule.scheduled_duration - schedule.planned_duration,
+        jaka_driver::kJakaServoInterpolationCycle);
+    EXPECT_EQ(schedule.setpoints.back().positions, trajectory.points.back().positions);
+}
+
+TEST(TrajectoryUtilsTest, QueueRejectsSourcePointsDenserThanServoTimeline)
+{
+    const auto trajectory = dense_negative_trajectory(3U, 0.001);
+    const auto schedule = jaka_driver::build_queued_servo_schedule(
+        trajectory, kExpectedJoints, std::vector<double>(6, 0.0),
+        jaka_driver::kJakaServoInterpolationCycle, 50U, 100U);
+
+    EXPECT_FALSE(schedule.valid);
+    EXPECT_NE(schedule.error.find("不足一个插补周期"), std::string::npos);
+}
+
 TEST(TrajectoryUtilsTest, QueueReordersJoints)
 {
     auto trajectory = valid_trajectory();
@@ -249,6 +297,89 @@ TEST(TrajectoryUtilsTest, QueueSplitsSparseTrajectoryAtMaximumStepCount)
     EXPECT_EQ(
         schedule.setpoints.back().positions,
         trajectory.points.front().positions);
+    EXPECT_EQ(schedule.setpoints.front().source_point_index, 0U);
+    EXPECT_EQ(schedule.setpoints.front().split_segment_index, 0U);
+    EXPECT_EQ(schedule.setpoints.front().split_segment_count, 115U);
+    EXPECT_EQ(schedule.setpoints.back().split_segment_index, 114U);
+    EXPECT_NEAR(
+        schedule.setpoints.front().scheduled_segment_duration,
+        0.4, 1e-12);
+}
+
+TEST(TrajectoryUtilsTest, DiagnosesMonotonicNegativeJointOneSchedule)
+{
+    auto trajectory = dense_negative_trajectory(20U, 0.1);
+    for (auto & point : trajectory.points)
+    {
+        point.velocities.assign(kExpectedJoints.size(), 0.0);
+        point.velocities[0] = -0.01;
+        point.accelerations.assign(kExpectedJoints.size(), 0.0);
+    }
+    const std::vector<double> actual_start(6, 0.0);
+    const auto schedule = jaka_driver::build_queued_servo_schedule(
+        trajectory, kExpectedJoints, actual_start,
+        jaka_driver::kJakaServoInterpolationCycle, 50U, 100U);
+    ASSERT_TRUE(schedule.valid) << schedule.error;
+
+    const auto diagnostics = jaka_driver::analyze_queued_servo_schedule(
+        schedule, actual_start);
+    ASSERT_TRUE(diagnostics.valid) << diagnostics.error;
+    EXPECT_EQ(diagnostics.positive_velocity_segments[0], 0U);
+    EXPECT_EQ(diagnostics.negative_velocity_segments[0], 20U);
+    EXPECT_EQ(diagnostics.velocity_sign_changes[0], 0U);
+    EXPECT_NEAR(diagnostics.maximum_absolute_velocity[0], 0.01, 0.001);
+    EXPECT_LT(diagnostics.duration_error, jaka_driver::kJakaServoInterpolationCycle);
+    EXPECT_EQ(schedule.setpoints.front().source_velocities.size(), 6U);
+    EXPECT_EQ(schedule.setpoints.front().source_accelerations.size(), 6U);
+}
+
+TEST(TrajectoryUtilsTest, DiagnosesGoalStartDiscontinuity)
+{
+    const auto trajectory = dense_negative_trajectory(2U, 0.1);
+    std::vector<double> actual_start(6, 0.0);
+    actual_start[0] = 0.01;
+    const auto schedule = jaka_driver::build_queued_servo_schedule(
+        trajectory, kExpectedJoints, actual_start,
+        jaka_driver::kJakaServoInterpolationCycle, 50U, 100U);
+    ASSERT_TRUE(schedule.valid) << schedule.error;
+
+    const auto diagnostics = jaka_driver::analyze_queued_servo_schedule(
+        schedule, actual_start);
+    ASSERT_TRUE(diagnostics.valid) << diagnostics.error;
+    EXPECT_EQ(diagnostics.maximum_start_error_joint, 0U);
+    EXPECT_NEAR(diagnostics.maximum_start_position_error, 0.01, 1e-12);
+}
+
+TEST(TrajectoryUtilsTest, WritesReplayableGoalAndServoScheduleCsv)
+{
+    const auto trajectory = dense_negative_trajectory(2U, 0.1);
+    const auto schedule = jaka_driver::build_queued_servo_schedule(
+        trajectory, kExpectedJoints, std::vector<double>(6, 0.0),
+        jaka_driver::kJakaServoInterpolationCycle, 50U, 100U);
+    ASSERT_TRUE(schedule.valid) << schedule.error;
+
+    const std::string goal_path = "/tmp/jaka_driver_goal_writer_test.csv";
+    const std::string schedule_path =
+        "/tmp/jaka_driver_schedule_writer_test.csv";
+    std::string error;
+    ASSERT_TRUE(jaka_driver::write_joint_trajectory_csv(
+        goal_path, trajectory, error)) << error;
+    ASSERT_TRUE(jaka_driver::write_queued_servo_schedule_csv(
+        schedule_path, schedule, kExpectedJoints, error)) << error;
+
+    std::ifstream goal_stream(goal_path);
+    std::ifstream schedule_stream(schedule_path);
+    std::string goal_header;
+    std::string schedule_header;
+    ASSERT_TRUE(std::getline(goal_stream, goal_header));
+    ASSERT_TRUE(std::getline(schedule_stream, schedule_header));
+    EXPECT_NE(goal_header.find("time_from_start_s,joint_1"), std::string::npos);
+    EXPECT_NE(
+        schedule_header.find("source_point_index"),
+        std::string::npos);
+    EXPECT_NE(
+        schedule_header.find("implicit_velocity_joint_1"),
+        std::string::npos);
 }
 
 TEST(TrajectoryUtilsTest, SamplesControllerQueueTimeline)

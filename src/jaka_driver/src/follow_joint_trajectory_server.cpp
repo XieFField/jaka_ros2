@@ -50,11 +50,17 @@ struct TrackingSample
     bool status_valid{false};
 };
 
-std::string make_telemetry_path()
+long long artifact_stamp()
 {
-    const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-    return "/tmp/jaka_trajectory_" + std::to_string(stamp) + ".csv";
+}
+
+std::string make_artifact_path(
+    const std::string & prefix,
+    long long stamp)
+{
+    return "/tmp/" + prefix + '_' + std::to_string(stamp) + ".csv";
 }
 
 bool write_tracking_csv(
@@ -167,6 +173,8 @@ FollowJointTrajectoryServer::FollowJointTrajectoryServer(
 {
     goal_tolerance_ = node_->declare_parameter<double>(
         "trajectory_goal_tolerance", goal_tolerance_);
+    start_tolerance_ = node_->declare_parameter<double>(
+        "trajectory_start_tolerance", start_tolerance_);
     goal_timeout_ = node_->declare_parameter<double>(
         "trajectory_goal_timeout", goal_timeout_);
     const auto maximum_servo_step_num = node_->declare_parameter<int64_t>(
@@ -188,6 +196,7 @@ FollowJointTrajectoryServer::FollowJointTrajectoryServer(
         static_cast<int64_t>(maximum_consecutive_starvations_));
 
     if (!std::isfinite(goal_tolerance_) || goal_tolerance_ <= 0.0 ||
+        !std::isfinite(start_tolerance_) || start_tolerance_ <= 0.0 ||
         !std::isfinite(goal_timeout_) || goal_timeout_ <= 0.0 ||
         !std::isfinite(maximum_trajectory_duration_) ||
         maximum_trajectory_duration_ <= 0.0 ||
@@ -228,9 +237,10 @@ FollowJointTrajectoryServer::FollowJointTrajectoryServer(
     RCLCPP_INFO(
         node_->get_logger(),
         "JAKA trajectory Action ready: %s, goal_tolerance=%.6f rad, "
+        "start_tolerance=%.6f rad, "
         "endpoint_margin=%.3f s, maximum_step_num=%u, servo_filter=%.3f Hz, "
         "maximum_queue_starvation=%.3f s, allowed_consecutive_starvations=%zu",
-        action_name.c_str(), goal_tolerance_, goal_timeout_,
+        action_name.c_str(), goal_tolerance_, start_tolerance_, goal_timeout_,
         maximum_servo_step_num_, servo_filter_cutoff_hz_,
         maximum_queue_starvation_, maximum_consecutive_starvations_);
 }
@@ -447,7 +457,13 @@ void FollowJointTrajectoryServer::execute(
     auto result = std::make_shared<Action::Result>();
     std::vector<TrackingSample> telemetry;
     std::vector<ServoCallTiming> servo_call_timings;
-    const std::string telemetry_path = make_telemetry_path();
+    const auto run_stamp = artifact_stamp();
+    const std::string telemetry_path = make_artifact_path(
+        "jaka_trajectory", run_stamp);
+    const std::string source_goal_path = make_artifact_path(
+        "jaka_source_goal", run_stamp);
+    const std::string servo_schedule_path = make_artifact_path(
+        "jaka_servo_schedule", run_stamp);
     bool telemetry_written = false;
     bool servo_mode_entered = false;
     std::size_t terminal_sample_index = 0U;
@@ -575,6 +591,54 @@ void FollowJointTrajectoryServer::execute(
             "构建 JAKA servo 调度失败: " + schedule.error);
         return;
     }
+    std::string artifact_error;
+    if (!write_joint_trajectory_csv(
+            source_goal_path, trajectory, artifact_error) ||
+        !write_queued_servo_schedule_csv(
+            servo_schedule_path, schedule, expected_joint_names_, artifact_error))
+    {
+        abort_goal(
+            Action::Result::INVALID_GOAL,
+            "轨迹诊断落盘失败，未进入 servo mode: " + artifact_error);
+        return;
+    }
+    const auto schedule_diagnostics = analyze_queued_servo_schedule(
+        schedule, initial_positions);
+    if (!schedule_diagnostics.valid)
+    {
+        abort_goal(
+            Action::Result::INVALID_GOAL,
+            "轨迹调度诊断失败，未进入 servo mode: " +
+            schedule_diagnostics.error);
+        return;
+    }
+    if (schedule_diagnostics.maximum_start_position_error > start_tolerance_)
+    {
+        abort_goal(
+            Action::Result::INVALID_GOAL,
+            "轨迹起点与实时关节位置不连续: joint=" +
+            expected_joint_names_[
+                schedule_diagnostics.maximum_start_error_joint] +
+            ", error=" + std::to_string(
+                schedule_diagnostics.maximum_start_position_error) +
+            " rad, tolerance=" + std::to_string(start_tolerance_) +
+            " rad；未进入 servo mode");
+        return;
+    }
+    RCLCPP_INFO(
+        node_->get_logger(),
+        "servo 转接预检: duration_error=%.9f s, start_error=%.9f rad "
+        "at %s, joint_1_velocity[max=%.9f rad/s positive=%zu negative=%zu "
+        "sign_changes=%zu], source_goal=%s, schedule=%s",
+        schedule_diagnostics.duration_error,
+        schedule_diagnostics.maximum_start_position_error,
+        expected_joint_names_[
+            schedule_diagnostics.maximum_start_error_joint].c_str(),
+        schedule_diagnostics.maximum_absolute_velocity[0],
+        schedule_diagnostics.positive_velocity_segments[0],
+        schedule_diagnostics.negative_velocity_segments[0],
+        schedule_diagnostics.velocity_sign_changes[0],
+        source_goal_path.c_str(), servo_schedule_path.c_str());
 
     int filter_ret;
     int enable_ret;

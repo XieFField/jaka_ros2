@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <set>
 
@@ -220,9 +222,16 @@ QueuedServoSchedule build_queued_servo_schedule(
 
     double previous_source_time = 0.0;
     std::vector<double> previous_positions = initial_positions;
+    std::vector<double> previous_implicit_velocity(
+        expected_joint_names.size(), 0.0);
+    bool have_previous_implicit_velocity = false;
     double controller_time = 0.0;
-    for (const auto & point : trajectory.points)
+    unsigned long long scheduled_steps = 0U;
+    schedule.source_start_positions = initial_positions;
+    for (std::size_t point_index = 0U;
+        point_index < trajectory.points.size(); ++point_index)
     {
+        const auto & point = trajectory.points[point_index];
         const double source_time = duration_seconds(point.time_from_start);
         auto positions = reorder_joint_values(
             trajectory.joint_names, point.positions, expected_joint_names);
@@ -238,6 +247,7 @@ QueuedServoSchedule build_queued_servo_schedule(
         {
             if (source_time == 0.0)
             {
+                schedule.source_start_positions = positions;
                 previous_positions = std::move(positions);
                 continue;
             }
@@ -249,17 +259,22 @@ QueuedServoSchedule build_queued_servo_schedule(
             continue;
         }
 
-        const auto total_steps = interpolation_steps(
-            previous_source_time, source_time, interpolation_cycle);
-        if (!total_steps)
+        const auto absolute_steps = interpolation_steps(
+            0.0, source_time, interpolation_cycle);
+        if (!absolute_steps ||
+            static_cast<unsigned long long>(*absolute_steps) <= scheduled_steps)
         {
-            schedule.error = "轨迹时间段无法转换为控制柜插补周期";
+            schedule.error =
+                "相邻轨迹点在控制柜绝对时间轴上不足一个插补周期: point=" +
+                std::to_string(point_index);
             return schedule;
         }
+        const auto total_steps = static_cast<unsigned int>(
+            static_cast<unsigned long long>(*absolute_steps) - scheduled_steps);
         const auto segment_count = static_cast<unsigned int>(
-            (*total_steps + maximum_step_num - 1U) / maximum_step_num);
-        const unsigned int base_steps = *total_steps / segment_count;
-        const unsigned int extra_steps = *total_steps % segment_count;
+            (total_steps + maximum_step_num - 1U) / maximum_step_num);
+        const unsigned int base_steps = total_steps / segment_count;
+        const unsigned int extra_steps = total_steps % segment_count;
         unsigned int accumulated_steps = 0U;
         for (unsigned int segment = 0U; segment < segment_count; ++segment)
         {
@@ -267,7 +282,7 @@ QueuedServoSchedule build_queued_servo_schedule(
                 base_steps + (segment < extra_steps ? 1U : 0U);
             accumulated_steps += segment_steps;
             const double ratio = static_cast<double>(accumulated_steps) /
-                static_cast<double>(*total_steps);
+                static_cast<double>(total_steps);
             std::vector<double> segment_positions(positions.size());
             for (std::size_t joint = 0; joint < positions.size(); ++joint)
             {
@@ -281,15 +296,54 @@ QueuedServoSchedule build_queued_servo_schedule(
                 schedule.error = "servo 队列分段数超过配置上限";
                 return schedule;
             }
-            schedule.setpoints.push_back({
-                controller_time,
-                controller_time + segment_duration,
-                previous_source_time + ratio *
-                (source_time - previous_source_time),
-                segment_steps,
-                std::move(segment_positions)});
+            const double previous_ratio = static_cast<double>(
+                accumulated_steps - segment_steps) /
+                static_cast<double>(total_steps);
+            QueuedServoSetpoint setpoint;
+            setpoint.controller_start_time = controller_time;
+            setpoint.controller_finish_time = controller_time + segment_duration;
+            setpoint.source_reference_time = previous_source_time + ratio *
+                (source_time - previous_source_time);
+            setpoint.step_num = segment_steps;
+            setpoint.positions = std::move(segment_positions);
+            setpoint.source_point_index = point_index;
+            setpoint.split_segment_index = segment;
+            setpoint.split_segment_count = segment_count;
+            setpoint.planned_segment_duration =
+                (ratio - previous_ratio) *
+                (source_time - previous_source_time);
+            setpoint.scheduled_segment_duration = segment_duration;
+            setpoint.source_velocities = reorder_joint_values(
+                trajectory.joint_names, point.velocities,
+                expected_joint_names);
+            setpoint.source_accelerations = reorder_joint_values(
+                trajectory.joint_names, point.accelerations,
+                expected_joint_names);
+            const auto & segment_start_positions = schedule.setpoints.empty() ?
+                previous_positions : schedule.setpoints.back().positions;
+            setpoint.implicit_velocities.resize(positions.size());
+            setpoint.implicit_accelerations.resize(positions.size());
+            for (std::size_t joint = 0U; joint < positions.size(); ++joint)
+            {
+                setpoint.implicit_velocities[joint] =
+                    (setpoint.positions[joint] - segment_start_positions[joint]) /
+                    segment_duration;
+                if (have_previous_implicit_velocity)
+                {
+                    const double previous_duration =
+                        schedule.setpoints.back().scheduled_segment_duration;
+                    setpoint.implicit_accelerations[joint] =
+                        (setpoint.implicit_velocities[joint] -
+                        previous_implicit_velocity[joint]) /
+                        (0.5 * (segment_duration + previous_duration));
+                }
+            }
+            previous_implicit_velocity = setpoint.implicit_velocities;
+            have_previous_implicit_velocity = true;
+            schedule.setpoints.push_back(std::move(setpoint));
             controller_time += segment_duration;
         }
+        scheduled_steps += total_steps;
         previous_source_time = source_time;
         previous_positions = std::move(positions);
     }
@@ -303,6 +357,253 @@ QueuedServoSchedule build_queued_servo_schedule(
     schedule.scheduled_duration = controller_time;
     schedule.valid = true;
     return schedule;
+}
+
+ServoScheduleDiagnostics analyze_queued_servo_schedule(
+    const QueuedServoSchedule & schedule,
+    const std::vector<double> & actual_initial_positions,
+    double velocity_deadband)
+{
+    ServoScheduleDiagnostics diagnostics;
+    if (!schedule.valid || schedule.setpoints.empty() ||
+        schedule.source_start_positions.empty() ||
+        actual_initial_positions.size() != schedule.source_start_positions.size() ||
+        !finite_values(actual_initial_positions) ||
+        !std::isfinite(velocity_deadband) || velocity_deadband < 0.0)
+    {
+        diagnostics.error = "servo 调度诊断输入无效";
+        return diagnostics;
+    }
+
+    const auto joint_count = actual_initial_positions.size();
+    diagnostics.maximum_absolute_velocity.assign(joint_count, 0.0);
+    diagnostics.maximum_absolute_acceleration.assign(joint_count, 0.0);
+    diagnostics.positive_velocity_segments.assign(joint_count, 0U);
+    diagnostics.negative_velocity_segments.assign(joint_count, 0U);
+    diagnostics.velocity_sign_changes.assign(joint_count, 0U);
+    std::vector<int> previous_sign(joint_count, 0);
+    diagnostics.minimum_step_num = std::numeric_limits<unsigned int>::max();
+
+    for (std::size_t joint = 0U; joint < joint_count; ++joint)
+    {
+        const double error = std::abs(
+            schedule.source_start_positions[joint] -
+            actual_initial_positions[joint]);
+        if (error > diagnostics.maximum_start_position_error)
+        {
+            diagnostics.maximum_start_position_error = error;
+            diagnostics.maximum_start_error_joint = joint;
+        }
+    }
+
+    for (const auto & setpoint : schedule.setpoints)
+    {
+        if (setpoint.positions.size() != joint_count ||
+            setpoint.implicit_velocities.size() != joint_count ||
+            setpoint.implicit_accelerations.size() != joint_count ||
+            setpoint.step_num == 0U ||
+            !finite_values(setpoint.positions) ||
+            !finite_values(setpoint.implicit_velocities) ||
+            !finite_values(setpoint.implicit_accelerations))
+        {
+            diagnostics.error = "servo 调度段维度错误或包含非有限数值";
+            return diagnostics;
+        }
+        diagnostics.minimum_step_num = std::min(
+            diagnostics.minimum_step_num, setpoint.step_num);
+        diagnostics.maximum_step_num = std::max(
+            diagnostics.maximum_step_num, setpoint.step_num);
+        for (std::size_t joint = 0U; joint < joint_count; ++joint)
+        {
+            const double velocity = setpoint.implicit_velocities[joint];
+            const double acceleration = setpoint.implicit_accelerations[joint];
+            diagnostics.maximum_absolute_velocity[joint] = std::max(
+                diagnostics.maximum_absolute_velocity[joint],
+                std::abs(velocity));
+            diagnostics.maximum_absolute_acceleration[joint] = std::max(
+                diagnostics.maximum_absolute_acceleration[joint],
+                std::abs(acceleration));
+            const int sign = velocity > velocity_deadband ? 1 :
+                (velocity < -velocity_deadband ? -1 : 0);
+            if (sign > 0)
+            {
+                ++diagnostics.positive_velocity_segments[joint];
+            }
+            else if (sign < 0)
+            {
+                ++diagnostics.negative_velocity_segments[joint];
+            }
+            if (sign != 0 && previous_sign[joint] != 0 &&
+                sign != previous_sign[joint])
+            {
+                ++diagnostics.velocity_sign_changes[joint];
+            }
+            if (sign != 0)
+            {
+                previous_sign[joint] = sign;
+            }
+        }
+    }
+    diagnostics.duration_error =
+        schedule.scheduled_duration - schedule.planned_duration;
+    diagnostics.valid = true;
+    return diagnostics;
+}
+
+bool write_queued_servo_schedule_csv(
+    const std::string & path,
+    const QueuedServoSchedule & schedule,
+    const std::vector<std::string> & joint_names,
+    std::string & error)
+{
+    if (!schedule.valid || schedule.setpoints.empty() || joint_names.empty())
+    {
+        error = "不能写出无效或空的 servo 调度";
+        return false;
+    }
+    std::ofstream stream(path);
+    if (!stream)
+    {
+        error = "无法创建 CSV: " + path;
+        return false;
+    }
+    stream << "command_index,source_point_index,split_segment_index,"
+              "split_segment_count,controller_start_s,controller_finish_s,"
+              "source_reference_s,planned_segment_s,scheduled_segment_s,step_num";
+    for (const auto & name : joint_names)
+    {
+        stream << ",position_" << name;
+    }
+    for (const auto & name : joint_names)
+    {
+        stream << ",implicit_velocity_" << name;
+    }
+    for (const auto & name : joint_names)
+    {
+        stream << ",implicit_acceleration_" << name;
+    }
+    for (const auto & name : joint_names)
+    {
+        stream << ",source_velocity_" << name;
+    }
+    for (const auto & name : joint_names)
+    {
+        stream << ",source_acceleration_" << name;
+    }
+    stream << '\n' << std::setprecision(12);
+    for (std::size_t index = 0U; index < schedule.setpoints.size(); ++index)
+    {
+        const auto & setpoint = schedule.setpoints[index];
+        stream << index << ',' << setpoint.source_point_index << ','
+               << setpoint.split_segment_index << ','
+               << setpoint.split_segment_count << ','
+               << setpoint.controller_start_time << ','
+               << setpoint.controller_finish_time << ','
+               << setpoint.source_reference_time << ','
+               << setpoint.planned_segment_duration << ','
+               << setpoint.scheduled_segment_duration << ','
+               << setpoint.step_num;
+        const auto write_values = [&stream, &joint_names](
+            const std::vector<double> & values) {
+                for (std::size_t joint = 0U; joint < joint_names.size(); ++joint)
+                {
+                    stream << ',';
+                    if (joint < values.size())
+                    {
+                        stream << values[joint];
+                    }
+                }
+            };
+        write_values(setpoint.positions);
+        write_values(setpoint.implicit_velocities);
+        write_values(setpoint.implicit_accelerations);
+        write_values(setpoint.source_velocities);
+        write_values(setpoint.source_accelerations);
+        stream << '\n';
+    }
+    if (!stream.good())
+    {
+        error = "写入 CSV 失败: " + path;
+        return false;
+    }
+    return true;
+}
+
+bool write_joint_trajectory_csv(
+    const std::string & path,
+    const trajectory_msgs::msg::JointTrajectory & trajectory,
+    std::string & error)
+{
+    if (trajectory.joint_names.empty() || trajectory.points.empty())
+    {
+        error = "不能写出关节名或轨迹点为空的 Goal";
+        return false;
+    }
+    std::ofstream stream(path);
+    if (!stream)
+    {
+        error = "无法创建 CSV: " + path;
+        return false;
+    }
+    stream << "time_from_start_s";
+    for (const auto & name : trajectory.joint_names)
+    {
+        stream << ',' << name;
+    }
+    for (const auto & name : trajectory.joint_names)
+    {
+        stream << ",velocity_" << name;
+    }
+    for (const auto & name : trajectory.joint_names)
+    {
+        stream << ",acceleration_" << name;
+    }
+    stream << '\n' << std::setprecision(12);
+    for (const auto & point : trajectory.points)
+    {
+        if (point.positions.size() != trajectory.joint_names.size() ||
+            (!point.velocities.empty() &&
+            point.velocities.size() != trajectory.joint_names.size()) ||
+            (!point.accelerations.empty() &&
+            point.accelerations.size() != trajectory.joint_names.size()) ||
+            !finite_values(point.positions) ||
+            !finite_values(point.velocities) ||
+            !finite_values(point.accelerations))
+        {
+            error = "Goal 数组维度错误或包含非有限数值";
+            return false;
+        }
+        stream << duration_seconds(point.time_from_start);
+        for (const double value : point.positions)
+        {
+            stream << ',' << value;
+        }
+        for (std::size_t joint = 0U;
+            joint < trajectory.joint_names.size(); ++joint)
+        {
+            stream << ',';
+            if (!point.velocities.empty())
+            {
+                stream << point.velocities[joint];
+            }
+        }
+        for (std::size_t joint = 0U;
+            joint < trajectory.joint_names.size(); ++joint)
+        {
+            stream << ',';
+            if (!point.accelerations.empty())
+            {
+                stream << point.accelerations[joint];
+            }
+        }
+        stream << '\n';
+    }
+    if (!stream.good())
+    {
+        error = "写入 CSV 失败: " + path;
+        return false;
+    }
+    return true;
 }
 
 std::optional<std::vector<double>> sample_queued_servo_schedule(

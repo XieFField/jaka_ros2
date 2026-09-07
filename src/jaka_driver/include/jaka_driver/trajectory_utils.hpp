@@ -21,6 +21,15 @@ struct QueuedServoSetpoint
     double source_reference_time{0.0};
     unsigned int step_num{1U};
     std::vector<double> positions;
+    std::size_t source_point_index{0U};
+    unsigned int split_segment_index{0U};
+    unsigned int split_segment_count{1U};
+    double planned_segment_duration{0.0};
+    double scheduled_segment_duration{0.0};
+    std::vector<double> implicit_velocities;
+    std::vector<double> implicit_accelerations;
+    std::vector<double> source_velocities;
+    std::vector<double> source_accelerations;
 };
 
 struct QueuedServoSchedule
@@ -29,7 +38,24 @@ struct QueuedServoSchedule
     std::string error;
     double planned_duration{0.0};
     double scheduled_duration{0.0};
+    std::vector<double> source_start_positions;
     std::vector<QueuedServoSetpoint> setpoints;
+};
+
+struct ServoScheduleDiagnostics
+{
+    bool valid{false};
+    std::string error;
+    double duration_error{0.0};
+    double maximum_start_position_error{0.0};
+    std::size_t maximum_start_error_joint{0U};
+    unsigned int minimum_step_num{0U};
+    unsigned int maximum_step_num{0U};
+    std::vector<double> maximum_absolute_velocity;
+    std::vector<double> maximum_absolute_acceleration;
+    std::vector<std::size_t> positive_velocity_segments;
+    std::vector<std::size_t> negative_velocity_segments;
+    std::vector<std::size_t> velocity_sign_changes;
 };
 
 struct ServoCallTiming
@@ -96,6 +122,22 @@ QueuedServoSchedule build_queued_servo_schedule(
     double interpolation_cycle,
     unsigned int maximum_step_num,
     std::size_t maximum_samples);
+
+ServoScheduleDiagnostics analyze_queued_servo_schedule(
+    const QueuedServoSchedule & schedule,
+    const std::vector<double> & actual_initial_positions,
+    double velocity_deadband = 1e-9);
+
+bool write_queued_servo_schedule_csv(
+    const std::string & path,
+    const QueuedServoSchedule & schedule,
+    const std::vector<std::string> & joint_names,
+    std::string & error);
+
+bool write_joint_trajectory_csv(
+    const std::string & path,
+    const trajectory_msgs::msg::JointTrajectory & trajectory,
+    std::string & error);
 
 std::optional<std::vector<double>> sample_queued_servo_schedule(
     const QueuedServoSchedule & schedule,
