@@ -53,6 +53,10 @@ private:
     rclcpp_action::Server<Action>::SharedPtr server_;
     double feedback_period_{0.05};
     double timeout_margin_{15.0};
+    double progress_timeout_{10.0};
+    double progress_epsilon_{1.0e-5};
+    double endpoint_settle_timeout_{2.0};
+    double status_log_period_{1.0};
 
     mutable std::mutex worker_mutex_;
     std::thread worker_;

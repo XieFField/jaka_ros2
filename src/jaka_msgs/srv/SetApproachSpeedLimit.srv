@@ -1,0 +1,9 @@
+# Controller approach-speed limits used by native motion commands.
+float64 linear_speed_limit_mm_s
+float64 angular_speed_limit_rad_s
+---
+bool success
+int32 error_code
+float64 actual_linear_speed_limit_mm_s
+float64 actual_angular_speed_limit_rad_s
+string message

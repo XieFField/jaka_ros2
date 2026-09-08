@@ -26,6 +26,7 @@
 #include "jaka_msgs/srv/get_ik.hpp"
 #include "jaka_msgs/srv/get_rapid_rate.hpp"
 #include "jaka_msgs/srv/set_rapid_rate.hpp"
+#include "jaka_msgs/srv/set_approach_speed_limit.hpp"
 #include "jaka_msgs/srv/clear_error.hpp"
 #include "jaka_msgs/srv/set_admittance_config.hpp"
 #include "jaka_msgs/srv/get_admittance_state.hpp"
@@ -1999,6 +2000,67 @@ void set_rapid_rate_callback(
     }
 }
 
+void set_approach_speed_limit_callback(
+    const std::shared_ptr<jaka_msgs::srv::SetApproachSpeedLimit::Request> request,
+    std::shared_ptr<jaka_msgs::srv::SetApproachSpeedLimit::Response> response)
+{
+    if (!std::isfinite(request->linear_speed_limit_mm_s) ||
+        request->linear_speed_limit_mm_s <= 0.0 ||
+        !std::isfinite(request->angular_speed_limit_rad_s) ||
+        request->angular_speed_limit_rad_s <= 0.0)
+    {
+        response->success = false;
+        response->error_code = -2;
+        response->message = "接近速度上限必须是有限正数";
+        return;
+    }
+    ScopedLegacyControl ownership;
+    if (!ownership.acquired())
+    {
+        response->success = false;
+        response->error_code = -3;
+        response->message = std::string("Control is owned by ") +
+            jaka_driver::control_owner_name(control_owner.load());
+        return;
+    }
+    std::lock_guard<std::mutex> lock(session_mutex);
+    if (!sdk_logged_in.load())
+    {
+        response->success = false;
+        response->error_code = -1;
+        response->message = "JAKA SDK 尚未登录";
+        return;
+    }
+    int ret = robot.set_approach_speed_limit(
+        request->linear_speed_limit_mm_s,
+        request->angular_speed_limit_rad_s);
+    if (ret == 0)
+    {
+        ret = robot.get_approach_speed_limit(
+            &response->actual_linear_speed_limit_mm_s,
+            &response->actual_angular_speed_limit_rad_s);
+    }
+    response->success = ret == 0 &&
+        std::isfinite(response->actual_linear_speed_limit_mm_s) &&
+        response->actual_linear_speed_limit_mm_s > 0.0 &&
+        std::isfinite(response->actual_angular_speed_limit_rad_s) &&
+        response->actual_angular_speed_limit_rad_s > 0.0;
+    response->error_code = ret;
+    response->message = response->success ?
+        "JAKA 接近速度上限设置并读回成功" :
+        "JAKA 接近速度上限设置或读回失败: " + sdk_error_text(ret);
+    if (response->success)
+    {
+        RCLCPP_INFO(
+            rclcpp::get_logger("set_approach_speed_limit_callback"),
+            "JAKA APPROACH SPEED LIMIT: requested=[%.3f mm/s %.6f rad/s], actual=[%.3f mm/s %.6f rad/s]",
+            request->linear_speed_limit_mm_s,
+            request->angular_speed_limit_rad_s,
+            response->actual_linear_speed_limit_mm_s,
+            response->actual_angular_speed_limit_rad_s);
+    }
+}
+
 void power_on_callback(
     const std::shared_ptr<std_srvs::srv::Trigger::Request>,
     std::shared_ptr<std_srvs::srv::Trigger::Response> response)
@@ -2303,6 +2365,7 @@ int main(int argc, char *argv[])
     auto logout_service = node->create_service<std_srvs::srv::Trigger>("/jaka_driver/logout", &logout_callback, rmw_qos_profile_services_default, sdk_callback_group);
     auto get_rapid_rate_service = node->create_service<jaka_msgs::srv::GetRapidRate>("/jaka_driver/get_rapid_rate", &get_rapid_rate_callback, rmw_qos_profile_services_default, sdk_callback_group);
     auto set_rapid_rate_service = node->create_service<jaka_msgs::srv::SetRapidRate>("/jaka_driver/set_rapid_rate", &set_rapid_rate_callback, rmw_qos_profile_services_default, sdk_callback_group);
+    auto set_approach_speed_limit_service = node->create_service<jaka_msgs::srv::SetApproachSpeedLimit>("/jaka_driver/set_approach_speed_limit", &set_approach_speed_limit_callback, rmw_qos_profile_services_default, sdk_callback_group);
     auto ft_limit_service = node->create_service<jaka_msgs::srv::SetTorqueSensorSoftLimit>("/jaka_driver/set_ft_soft_limit", &set_torque_sensor_soft_limit_callback, rmw_qos_profile_services_default, sdk_callback_group);
     auto admittance_config_service = node->create_service<jaka_msgs::srv::SetAdmittanceConfig>("/jaka_driver/set_admittance_config", &set_admittance_config_callback, rmw_qos_profile_services_default, sdk_callback_group);
     auto force_control_frame_service = node->create_service<jaka_msgs::srv::SetForceControlFrame>("/jaka_driver/set_force_control_frame", &set_force_control_frame_callback, rmw_qos_profile_services_default, sdk_callback_group);

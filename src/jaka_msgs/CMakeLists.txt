@@ -39,6 +39,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/GetIK.srv"
   "srv/GetRapidRate.srv"
   "srv/SetRapidRate.srv"
+  "srv/SetApproachSpeedLimit.srv"
   "srv/SetTorqueSensorSoftLimit.srv"
   "srv/SetAdmittanceConfig.srv"
   "srv/SetForceControlFrame.srv"

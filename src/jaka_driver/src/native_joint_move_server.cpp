@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -39,6 +40,14 @@ NativeJointMoveServer::NativeJointMoveServer(
         "native_joint_move_feedback_period", 0.05);
     timeout_margin_ = node_->declare_parameter<double>(
         "native_joint_move_timeout_margin", 15.0);
+    progress_timeout_ = node_->declare_parameter<double>(
+        "native_joint_move_progress_timeout", 10.0);
+    progress_epsilon_ = node_->declare_parameter<double>(
+        "native_joint_move_progress_epsilon", 1.0e-5);
+    endpoint_settle_timeout_ = node_->declare_parameter<double>(
+        "native_joint_move_endpoint_settle_timeout", 2.0);
+    status_log_period_ = node_->declare_parameter<double>(
+        "native_joint_move_status_log_period", 1.0);
     if (!std::isfinite(feedback_period_) || feedback_period_ <= 0.0)
     {
         throw std::invalid_argument(
@@ -48,6 +57,15 @@ NativeJointMoveServer::NativeJointMoveServer(
     {
         throw std::invalid_argument(
             "native_joint_move_timeout_margin 必须为有限非负数");
+    }
+    if (!std::isfinite(progress_timeout_) || progress_timeout_ <= 0.0 ||
+        !std::isfinite(progress_epsilon_) || progress_epsilon_ <= 0.0 ||
+        !std::isfinite(endpoint_settle_timeout_) ||
+        endpoint_settle_timeout_ <= 0.0 ||
+        !std::isfinite(status_log_period_) || status_log_period_ <= 0.0)
+    {
+        throw std::invalid_argument(
+            "原生 joint_move 进度监控参数必须为有限正数");
     }
     server_ = rclcpp_action::create_server<Action>(
         node_, action_name,
@@ -214,6 +232,9 @@ void NativeJointMoveServer::execute(
         result->success = false;
         result->sdk_error_code = code;
         result->message = message;
+        RCLCPP_ERROR(
+            node_->get_logger(), "NATIVE PTP FAIL: request=%s, code=%d, %s",
+            goal->request_id.c_str(), code, message.c_str());
         goal_handle->abort(result);
         finish();
     };
@@ -224,11 +245,20 @@ void NativeJointMoveServer::execute(
         target.jVal);
     int command_ret;
     double rapid_rate = 0.0;
+    double approach_linear_speed = std::numeric_limits<double>::quiet_NaN();
+    double approach_angular_speed = std::numeric_limits<double>::quiet_NaN();
     JointValue initial{};
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
         const int rapid_ret = robot_.get_rapidrate(&rapid_rate);
         const int joint_ret = robot_.get_joint_position(&initial);
+        const int approach_ret = robot_.get_approach_speed_limit(
+            &approach_linear_speed, &approach_angular_speed);
+        if (approach_ret != 0)
+        {
+            approach_linear_speed = std::numeric_limits<double>::quiet_NaN();
+            approach_angular_speed = std::numeric_limits<double>::quiet_NaN();
+        }
         if (rapid_ret != 0 || joint_ret != 0 || !std::isfinite(rapid_rate) ||
             rapid_rate <= 0.0 || rapid_rate > 1.0)
         {
@@ -255,18 +285,25 @@ void NativeJointMoveServer::execute(
     }
     const double estimated_duration = estimate_native_joint_move_duration(
         maximum_delta, goal->speed, goal->acceleration, rapid_rate);
-    const double effective_timeout = std::max(
+    const double reference_timeout = std::max(
         goal->timeout, estimated_duration + timeout_margin_);
     RCLCPP_INFO(
         node_->get_logger(),
-        "NATIVE PTP START: request=%s, programmed_speed=%.6f rad/s, rapid_rate=%.3f, effective_speed=%.6f rad/s, programmed_acceleration=%.6f rad/s^2, estimated_duration=%.3f s, requested_timeout=%.3f s, effective_timeout=%.3f s, tolerance=%.6f rad",
+        "NATIVE PTP START: request=%s, programmed_speed=%.6f rad/s, rapid_rate=%.3f, nominal_effective_speed=%.6f rad/s, programmed_acceleration=%.6f rad/s^2, approach_limits=[%.3f mm/s %.6f rad/s], estimated_duration=%.3f s, reference_timeout=%.3f s, progress_timeout=%.3f s, tolerance=%.6f rad",
         goal->request_id.c_str(), goal->speed, rapid_rate,
-        goal->speed * rapid_rate, goal->acceleration, estimated_duration,
-        goal->timeout, effective_timeout, goal->endpoint_tolerance);
+        goal->speed * rapid_rate, goal->acceleration,
+        approach_linear_speed, approach_angular_speed, estimated_duration,
+        reference_timeout, progress_timeout_, goal->endpoint_tolerance);
 
     const auto started = std::chrono::steady_clock::now();
-    const auto deadline =
-        started + std::chrono::duration<double>(effective_timeout);
+    auto last_progress = started;
+    auto next_status_log = started +
+        std::chrono::duration<double>(status_log_period_);
+    double best_error = maximum_joint_error(
+        goal->target_positions, joint_vector(initial));
+    bool motion_observed = false;
+    bool reference_timeout_reported = false;
+    std::optional<std::chrono::steady_clock::time_point> stopped_since;
     const auto period = std::chrono::duration<double>(feedback_period_);
     while (rclcpp::ok() && !shutting_down_.load())
     {
@@ -291,13 +328,6 @@ void NativeJointMoveServer::execute(
             finish();
             return;
         }
-        if (now >= deadline)
-        {
-            const int abort_ret = abort_motion();
-            fail(abort_ret, "原生 joint_move 执行超时");
-            return;
-        }
-
         RobotStatus_simple status{};
         MotionStatus motion{};
         JointValue actual{};
@@ -322,6 +352,18 @@ void NativeJointMoveServer::execute(
 
         result->max_joint_error = maximum_joint_error(
             goal->target_positions, joint_vector(actual));
+        bool made_progress = false;
+        if (best_error - result->max_joint_error >= progress_epsilon_)
+        {
+            best_error = result->max_joint_error;
+            last_progress = now;
+            motion_observed = true;
+            made_progress = true;
+        }
+        if (!motion.inpos || motion.queue > 0 || motion.active_queue > 0)
+        {
+            motion_observed = true;
+        }
         auto feedback = std::make_shared<Action::Feedback>();
         feedback->elapsed = elapsed;
         feedback->in_position = motion.inpos;
@@ -357,6 +399,63 @@ void NativeJointMoveServer::execute(
             goal_handle->succeed(result);
             finish();
             return;
+        }
+        if (motion_observed && !made_progress && motion.inpos &&
+            motion.queue == 0)
+        {
+            if (!stopped_since.has_value())
+            {
+                stopped_since = now;
+            }
+            else if (std::chrono::duration<double>(
+                now - *stopped_since).count() >= endpoint_settle_timeout_)
+            {
+                const int abort_ret = abort_motion();
+                fail(
+                    abort_ret,
+                    "原生 joint_move 已停止但终点误差未进入容差: error=" +
+                    std::to_string(result->max_joint_error) +
+                    ", tolerance=" +
+                    std::to_string(goal->endpoint_tolerance));
+                return;
+            }
+        }
+        else
+        {
+            stopped_since.reset();
+        }
+
+        const double no_progress_time =
+            std::chrono::duration<double>(now - last_progress).count();
+        if (no_progress_time >= progress_timeout_)
+        {
+            const int abort_ret = abort_motion();
+            fail(
+                abort_ret,
+                "原生 joint_move 连续无有效进展: no_progress=" +
+                std::to_string(no_progress_time) + " s, error=" +
+                std::to_string(result->max_joint_error) +
+                ", best_error=" + std::to_string(best_error));
+            return;
+        }
+        if (!reference_timeout_reported && elapsed >= reference_timeout)
+        {
+            reference_timeout_reported = true;
+            RCLCPP_WARN(
+                node_->get_logger(),
+                "NATIVE PTP REFERENCE TIME EXCEEDED: request=%s, elapsed=%.3f s, reference=%.3f s; robot healthy and progressing, continue monitoring",
+                goal->request_id.c_str(), elapsed, reference_timeout);
+        }
+        if (now >= next_status_log)
+        {
+            RCLCPP_INFO(
+                node_->get_logger(),
+                "NATIVE PTP PROGRESS: request=%s, elapsed=%.3f s, error=%.9f rad, best_error=%.9f rad, no_progress=%.3f s, inpos=%d, queue=%d, active_queue=%d",
+                goal->request_id.c_str(), elapsed, result->max_joint_error,
+                best_error, no_progress_time, motion.inpos, motion.queue,
+                motion.active_queue);
+            next_status_log = now +
+                std::chrono::duration<double>(status_log_period_);
         }
         std::this_thread::sleep_for(period);
     }

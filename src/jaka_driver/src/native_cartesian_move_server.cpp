@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <utility>
 
 #include "jaka_driver/native_joint_move_utils.hpp"
@@ -103,10 +104,28 @@ NativeCartesianMoveServer::NativeCartesianMoveServer(
 {
   feedback_period_ = node_->declare_parameter<double>(
     "native_cartesian_move_feedback_period", 0.05);
-  if (!std::isfinite(feedback_period_) || feedback_period_ <= 0.0)
+  progress_timeout_ = node_->declare_parameter<double>(
+    "native_cartesian_move_progress_timeout", 10.0);
+  translation_progress_epsilon_ = node_->declare_parameter<double>(
+    "native_cartesian_move_translation_progress_epsilon", 0.001);
+  rotation_progress_epsilon_ = node_->declare_parameter<double>(
+    "native_cartesian_move_rotation_progress_epsilon", 1.0e-5);
+  endpoint_settle_timeout_ = node_->declare_parameter<double>(
+    "native_cartesian_move_endpoint_settle_timeout", 2.0);
+  status_log_period_ = node_->declare_parameter<double>(
+    "native_cartesian_move_status_log_period", 1.0);
+  if (!std::isfinite(feedback_period_) || feedback_period_ <= 0.0 ||
+    !std::isfinite(progress_timeout_) || progress_timeout_ <= 0.0 ||
+    !std::isfinite(translation_progress_epsilon_) ||
+    translation_progress_epsilon_ <= 0.0 ||
+    !std::isfinite(rotation_progress_epsilon_) ||
+    rotation_progress_epsilon_ <= 0.0 ||
+    !std::isfinite(endpoint_settle_timeout_) ||
+    endpoint_settle_timeout_ <= 0.0 ||
+    !std::isfinite(status_log_period_) || status_log_period_ <= 0.0)
   {
     throw std::invalid_argument(
-            "native_cartesian_move_feedback_period 必须为有限正数");
+            "原生笛卡尔运动监控参数必须为有限正数");
   }
   server_ = rclcpp_action::create_server<Action>(
     node_, action_name,
@@ -235,6 +254,8 @@ void NativeCartesianMoveServer::execute(
   const CartesianPose target = sdk_pose(goal->target_pose);
   const CartesianPose midpoint = sdk_pose(goal->midpoint_pose);
   double rapid_rate = 0.0;
+  double approach_linear_speed = std::numeric_limits<double>::quiet_NaN();
+  double approach_angular_speed = std::numeric_limits<double>::quiet_NaN();
   int command_ret = 0;
   {
     std::lock_guard<std::mutex> lock(session_mutex_);
@@ -243,6 +264,12 @@ void NativeCartesianMoveServer::execute(
       rapid_rate <= 0.0 || rapid_rate > 1.0))
     {
       command_ret = -2;
+    }
+    if (command_ret == 0 && robot_.get_approach_speed_limit(
+        &approach_linear_speed, &approach_angular_speed) != 0)
+    {
+      approach_linear_speed = std::numeric_limits<double>::quiet_NaN();
+      approach_angular_speed = std::numeric_limits<double>::quiet_NaN();
     }
     if (command_ret == 0 && goal->motion_type == goal->LINEAR)
     {
@@ -265,14 +292,30 @@ void NativeCartesianMoveServer::execute(
   }
   RCLCPP_INFO(
     node_->get_logger(),
-    "NATIVE CARTESIAN START: request=%s, type=%s, programmed_speed=%.3f mm/s, rapid_rate=%.3f, effective_speed=%.3f mm/s, acceleration=%.3f mm/s^2, timeout=%.3f s",
+    "NATIVE CARTESIAN START: request=%s, type=%s, programmed_speed=%.3f mm/s, rapid_rate=%.3f, nominal_effective_speed=%.3f mm/s, acceleration=%.3f mm/s^2, approach_limits=[%.3f mm/s %.6f rad/s], timeout=%.3f s",
     goal->request_id.c_str(),
     goal->motion_type == goal->LINEAR ? "LIN" : "CIRC",
     goal->speed, rapid_rate, goal->speed * rapid_rate,
-    goal->acceleration, goal->timeout);
+    goal->acceleration, approach_linear_speed, approach_angular_speed,
+    goal->timeout);
+  const double nominal_effective_speed = goal->speed * rapid_rate;
+  if (std::isfinite(approach_linear_speed) &&
+    approach_linear_speed + 1.0e-6 < nominal_effective_speed)
+  {
+    RCLCPP_WARN(
+      node_->get_logger(),
+      "NATIVE CARTESIAN SPEED LIMITED: request=%s, nominal=%.3f mm/s exceeds controller approach limit %.3f mm/s",
+      goal->request_id.c_str(), nominal_effective_speed,
+      approach_linear_speed);
+  }
 
   const auto started = std::chrono::steady_clock::now();
-  const auto deadline = started + std::chrono::duration<double>(goal->timeout);
+  auto last_progress = started;
+  auto next_status_log = started +
+    std::chrono::duration<double>(status_log_period_);
+  bool reference_timeout_reported = false;
+  std::optional<CartesianPose> previous_pose;
+  std::optional<std::chrono::steady_clock::time_point> stopped_since;
   const auto period = std::chrono::duration<double>(feedback_period_);
   while (rclcpp::ok() && !shutting_down_.load())
   {
@@ -292,13 +335,6 @@ void NativeCartesianMoveServer::execute(
       fail(0, "原生笛卡尔运动被外部停止");
       return;
     }
-    if (now >= deadline)
-    {
-      const int ret = abort_motion();
-      fail(ret, "原生笛卡尔运动执行超时");
-      return;
-    }
-
     RobotStatus_simple status{};
     MotionStatus motion{};
     CartesianPose actual{};
@@ -341,6 +377,18 @@ void NativeCartesianMoveServer::execute(
       fail(status.errcode, "原生笛卡尔运动期间机器人状态异常");
       return;
     }
+
+    if (previous_pose.has_value())
+    {
+      const auto movement = pose_error(*previous_pose, actual);
+      if (movement.first >= translation_progress_epsilon_ ||
+        movement.second >= rotation_progress_epsilon_)
+      {
+        last_progress = now;
+      }
+    }
+    previous_pose = actual;
+
     if (motion.inpos && motion.queue == 0 &&
       errors.first <= goal->translation_tolerance &&
       errors.second <= goal->rotation_tolerance)
@@ -355,6 +403,54 @@ void NativeCartesianMoveServer::execute(
       goal_handle->succeed(result);
       finish();
       return;
+    }
+    const bool stopped = motion.inpos && motion.queue == 0 &&
+      motion.active_queue == 0;
+    if (stopped)
+    {
+      if (!stopped_since.has_value()) stopped_since = now;
+      if (std::chrono::duration<double>(now - *stopped_since).count() >=
+        endpoint_settle_timeout_)
+      {
+        fail(
+          0, "原生笛卡尔运动已停止但终点未进入容差: translation_error=" +
+          std::to_string(errors.first) + " mm, rotation_error=" +
+          std::to_string(errors.second) + " rad");
+        return;
+      }
+    }
+    else
+    {
+      stopped_since.reset();
+    }
+
+    const double no_progress =
+      std::chrono::duration<double>(now - last_progress).count();
+    if (!stopped && no_progress >= progress_timeout_)
+    {
+      const int ret = abort_motion();
+      fail(
+        ret, "原生笛卡尔运动长时间没有实际位姿进展: no_progress=" +
+        std::to_string(no_progress) + " s");
+      return;
+    }
+    if (!reference_timeout_reported && elapsed >= goal->timeout)
+    {
+      reference_timeout_reported = true;
+      RCLCPP_WARN(
+        node_->get_logger(),
+        "NATIVE CARTESIAN REFERENCE TIME EXCEEDED: request=%s, elapsed=%.3f s, reference=%.3f s; robot healthy and moving, continue monitoring",
+        goal->request_id.c_str(), elapsed, goal->timeout);
+    }
+    if (now >= next_status_log)
+    {
+      RCLCPP_INFO(
+        node_->get_logger(),
+        "NATIVE CARTESIAN PROGRESS: request=%s, elapsed=%.3f s, translation_error=%.6f mm, rotation_error=%.6f rad, no_progress=%.3f s, inpos=%d, queue=%d, active_queue=%d",
+        goal->request_id.c_str(), elapsed, errors.first, errors.second,
+        no_progress, motion.inpos, motion.queue, motion.active_queue);
+      next_status_log = now +
+        std::chrono::duration<double>(status_log_period_);
     }
     std::this_thread::sleep_for(period);
   }

@@ -50,6 +50,11 @@ private:
   std::mutex & session_mutex_;
   rclcpp_action::Server<Action>::SharedPtr server_;
   double feedback_period_{0.05};
+  double progress_timeout_{10.0};
+  double translation_progress_epsilon_{0.001};
+  double rotation_progress_epsilon_{1.0e-5};
+  double endpoint_settle_timeout_{2.0};
+  double status_log_period_{1.0};
   mutable std::mutex worker_mutex_;
   std::thread worker_;
   std::atomic<bool> goal_active_{false};
