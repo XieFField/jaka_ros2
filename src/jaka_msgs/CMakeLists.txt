@@ -22,6 +22,9 @@ find_package(std_srvs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/RobotMsg.msg"
 
+  "action/ExecuteJointMove.action"
+  "action/ExecuteCartesianMove.action"
+
   "srv/Move.srv"
   "srv/ServoMoveEnable.srv"
   "srv/ServoMove.srv"
@@ -34,9 +37,12 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/ClearError.srv"
   "srv/GetFK.srv"
   "srv/GetIK.srv"
+  "srv/GetRapidRate.srv"
+  "srv/SetRapidRate.srv"
   "srv/SetTorqueSensorSoftLimit.srv"
   "srv/SetAdmittanceConfig.srv"
   "srv/SetForceControlFrame.srv"
+  "srv/SetComplianceProfile.srv"
   "srv/GetAdmittanceState.srv"
   "srv/SetToolDriveConfig.srv"
   "srv/SetToolDriveFrame.srv"

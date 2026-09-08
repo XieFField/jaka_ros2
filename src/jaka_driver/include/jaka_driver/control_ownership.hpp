@@ -11,6 +11,8 @@ enum class ControlOwner
 {
     kIdle,
     kTrajectory,
+    kNativeMotion,
+    kNativeCartesianMotion,
     kCompliance,
     kToolDrive,
     kLegacyMotion,
@@ -24,6 +26,10 @@ inline const char * control_owner_name(ControlOwner owner)
             return "idle";
         case ControlOwner::kTrajectory:
             return "trajectory";
+        case ControlOwner::kNativeMotion:
+            return "native_motion";
+        case ControlOwner::kNativeCartesianMotion:
+            return "native_cartesian_motion";
         case ControlOwner::kCompliance:
             return "compliance";
         case ControlOwner::kToolDrive:

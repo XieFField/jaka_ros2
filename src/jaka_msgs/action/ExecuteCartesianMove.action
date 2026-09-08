@@ -1,0 +1,31 @@
+uint8 LINEAR=1
+uint8 CIRCULAR=2
+
+string request_id
+uint8 motion_type
+# SDK CartesianPose: x/y/z in mm, rx/ry/rz in rad.
+float64[6] target_pose
+float64[6] midpoint_pose
+bool has_midpoint
+float64 speed
+float64 acceleration
+float64 orientation_speed
+float64 orientation_acceleration
+float64 translation_tolerance
+float64 rotation_tolerance
+float64 timeout
+---
+bool success
+int32 sdk_error_code
+float64 translation_error
+float64 rotation_error
+string message
+---
+float64 elapsed
+bool in_position
+int32 queue_depth
+float64 translation_error
+float64 rotation_error
+bool powered
+bool enabled
+int32 controller_error_code

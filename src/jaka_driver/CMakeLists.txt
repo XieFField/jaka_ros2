@@ -33,6 +33,9 @@ find_package(rosidl_default_generators REQUIRED)
 add_executable(jaka_driver
   src/jaka_driver.cpp
   src/follow_joint_trajectory_server.cpp
+  src/native_cartesian_move_server.cpp
+  src/native_joint_move_server.cpp
+  src/native_joint_move_utils.cpp
   src/trajectory_utils.cpp
 )
 add_executable(sdk_test src/sdk_test.cpp)
@@ -44,7 +47,9 @@ add_executable(trajectory_adapter_diagnostic
 )
 add_executable(fixed_joint1_negative_goal
   src/fixed_joint1_negative_goal.cpp
+  src/trajectory_utils.cpp
 )
+add_executable(native_joint_move_smoke src/native_joint_move_smoke.cpp)
 
 # Link libraries
 ament_target_dependencies(jaka_driver
@@ -93,6 +98,12 @@ ament_target_dependencies(fixed_joint1_negative_goal
   control_msgs
   trajectory_msgs
 )
+ament_target_dependencies(native_joint_move_smoke
+  rclcpp
+  rclcpp_action
+  sensor_msgs
+  jaka_msgs
+)
 
 # For including directories in ROS 2
 target_include_directories(jaka_driver
@@ -128,6 +139,12 @@ target_include_directories(trajectory_adapter_diagnostic
     include
 )
 
+target_include_directories(fixed_joint1_negative_goal
+  PUBLIC
+    include
+)
+target_include_directories(native_joint_move_smoke PUBLIC include)
+
 
 
 # Specify where to find external libraries
@@ -150,6 +167,7 @@ install(TARGETS
   servoj_demo
   trajectory_adapter_diagnostic
   fixed_joint1_negative_goal
+  native_joint_move_smoke
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -174,6 +192,14 @@ if(BUILD_TESTING)
   )
   if(TARGET control_ownership_test)
     target_include_directories(control_ownership_test PUBLIC include)
+  endif()
+
+  ament_add_gtest(native_joint_move_utils_test
+    test/native_joint_move_utils_test.cpp
+    src/native_joint_move_utils.cpp
+  )
+  if(TARGET native_joint_move_utils_test)
+    target_include_directories(native_joint_move_utils_test PUBLIC include)
   endif()
 endif()
 

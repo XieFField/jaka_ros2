@@ -1,0 +1,5 @@
+---
+bool success
+int32 error_code
+float64 rapid_rate
+string message

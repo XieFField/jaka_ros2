@@ -24,10 +24,13 @@
 #include "jaka_msgs/srv/get_io.hpp"
 #include "jaka_msgs/srv/get_fk.hpp"
 #include "jaka_msgs/srv/get_ik.hpp"
+#include "jaka_msgs/srv/get_rapid_rate.hpp"
+#include "jaka_msgs/srv/set_rapid_rate.hpp"
 #include "jaka_msgs/srv/clear_error.hpp"
 #include "jaka_msgs/srv/set_admittance_config.hpp"
 #include "jaka_msgs/srv/get_admittance_state.hpp"
 #include "jaka_msgs/srv/set_force_control_frame.hpp"
+#include "jaka_msgs/srv/set_compliance_profile.hpp"
 #include "jaka_msgs/srv/set_torque_sensor_soft_limit.hpp"
 #include "jaka_msgs/srv/set_tool_drive_config.hpp"
 #include "jaka_msgs/srv/set_tool_drive_frame.hpp"
@@ -39,6 +42,8 @@
 #include "jaka_driver/jktypes.h"
 #include "jaka_driver/conversion.h"
 #include "jaka_driver/follow_joint_trajectory_server.hpp"
+#include "jaka_driver/native_cartesian_move_server.hpp"
+#include "jaka_driver/native_joint_move_server.hpp"
 #include "jaka_driver/control_ownership.hpp"
 
 #include <action_msgs/msg/goal_status_array.hpp>
@@ -85,6 +90,9 @@ std::mutex session_mutex;
 std::atomic<jaka_driver::ControlOwner> control_owner{
     jaka_driver::ControlOwner::kIdle};
 std::weak_ptr<jaka_driver::FollowJointTrajectoryServer> trajectory_server;
+std::weak_ptr<jaka_driver::NativeJointMoveServer> native_joint_move_server;
+std::weak_ptr<jaka_driver::NativeCartesianMoveServer>
+    native_cartesian_move_server;
 
 std::string sdk_error_text(int code)
 {
@@ -190,7 +198,8 @@ void set_torque_sensor_soft_limit_callback(
         request->limits[3], request->limits[4], request->limits[5]};
     const int ret = robot.set_torque_sensor_soft_limit(limits);
     response->success = ret == 0;
-    response->error_code = ret;
+    response->error_code = ret != 0 ? ret :
+        (response->success ? 0 : -2);
     response->message = ret == 0 ?
         "Torque sensor soft limits configured" :
         "set_torque_sensor_soft_limit failed: " + std::to_string(ret);
@@ -231,7 +240,8 @@ void set_admittance_config_callback(
         request->normal_track,
         request->rebound_wrench);
     response->success = ret == 0;
-    response->error_code = ret;
+    response->error_code = ret != 0 ? ret :
+        (response->success ? 0 : -2);
     response->message = ret == 0 ?
         "Admittance axis configured" :
         "set_admit_ctrl_config failed: " + std::to_string(ret);
@@ -285,6 +295,10 @@ void get_admittance_state_callback(
     BOOL control_enabled = 0;
     int sensor_compensation = 0;
     int compliance_type = 0;
+    double compliance_linear_speed = 0.0;
+    double compliance_angular_speed = 0.0;
+    double approach_linear_speed = 0.0;
+    double approach_angular_speed = 0.0;
     RobotAdmitCtrl configurations{};
     int ret = robot.get_torque_sensor_soft_limit(&soft_limits);
     if (ret == 0)
@@ -303,6 +317,16 @@ void get_admittance_state_callback(
     {
         ret = robot.get_compliant_type(
             &sensor_compensation, &compliance_type);
+    }
+    if (ret == 0)
+    {
+        ret = robot.get_compliant_speed_limit(
+            &compliance_linear_speed, &compliance_angular_speed);
+    }
+    if (ret == 0)
+    {
+        ret = robot.get_approach_speed_limit(
+            &approach_linear_speed, &approach_angular_speed);
     }
     if (ret != 0)
     {
@@ -332,11 +356,91 @@ void get_admittance_state_callback(
     response->force_control_frame = static_cast<int>(control_frame);
     response->sensor_compensation = sensor_compensation;
     response->compliance_type = compliance_type;
+    response->compliance_linear_speed_limit_mm_s = compliance_linear_speed;
+    response->compliance_angular_speed_limit_rad_s = compliance_angular_speed;
+    response->approach_linear_speed_limit_mm_s = approach_linear_speed;
+    response->approach_angular_speed_limit_rad_s = approach_angular_speed;
     response->control_owner = jaka_driver::control_owner_name(
         control_owner.load());
     response->success = true;
     response->error_code = 0;
     response->message = "JAKA admittance state read successfully";
+}
+
+void set_compliance_profile_callback(
+    const std::shared_ptr<jaka_msgs::srv::SetComplianceProfile::Request> request,
+    std::shared_ptr<jaka_msgs::srv::SetComplianceProfile::Response> response)
+{
+    const auto finite_nonnegative = [](double value)
+        {return std::isfinite(value) && value >= 0.0;};
+    if ((request->sensor_compensation != 0 &&
+         request->sensor_compensation != 1) ||
+        request->compliance_type < 0 || request->compliance_type > 2 ||
+        !finite_nonnegative(request->compliance_linear_speed_limit_mm_s) ||
+        !finite_nonnegative(request->compliance_angular_speed_limit_rad_s) ||
+        !finite_nonnegative(request->approach_linear_speed_limit_mm_s) ||
+        !finite_nonnegative(request->approach_angular_speed_limit_rad_s))
+    {
+        response->success = false;
+        response->error_code = -2;
+        response->message = "Invalid compliance profile";
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(session_mutex);
+    if (!sdk_logged_in.load())
+    {
+        response->success = false;
+        response->error_code = -1;
+        response->message = "SDK is not logged in";
+        return;
+    }
+    if (control_owner.load() != jaka_driver::ControlOwner::kIdle)
+    {
+        response->success = false;
+        response->error_code = -3;
+        response->message = std::string("Control is owned by ") +
+            jaka_driver::control_owner_name(control_owner.load());
+        return;
+    }
+
+    int ret = robot.set_compliant_speed_limit(
+        request->compliance_linear_speed_limit_mm_s,
+        request->compliance_angular_speed_limit_rad_s);
+    if (ret == 0)
+    {
+        ret = robot.set_approach_speed_limit(
+            request->approach_linear_speed_limit_mm_s,
+            request->approach_angular_speed_limit_rad_s);
+    }
+    if (ret == 0)
+    {
+        ret = robot.set_compliant_type(
+            request->sensor_compensation, request->compliance_type);
+    }
+    if (ret == 0)
+    {
+        ret = robot.get_compliant_type(
+            &response->actual_sensor_compensation,
+            &response->actual_compliance_type);
+    }
+    if (ret == 0)
+    {
+        ret = robot.get_compliant_speed_limit(
+            &response->actual_compliance_linear_speed_limit_mm_s,
+            &response->actual_compliance_angular_speed_limit_rad_s);
+    }
+    if (ret == 0)
+    {
+        ret = robot.get_approach_speed_limit(
+            &response->actual_approach_linear_speed_limit_mm_s,
+            &response->actual_approach_angular_speed_limit_rad_s);
+    }
+    response->success = ret == 0;
+    response->error_code = ret;
+    response->message = ret == 0 ?
+        "Compliance profile configured and read back" :
+        "JAKA compliance profile operation failed: " + std::to_string(ret);
 }
 
 void enable_admittance_callback(
@@ -397,8 +501,11 @@ void enable_admittance_callback(
             // 兼容仅提供统一力控关闭接口的控制器版本。
             ret = robot.disable_force_control();
         }
-        jaka_driver::release_control(
-            control_owner, jaka_driver::ControlOwner::kCompliance);
+        if (ret == 0)
+        {
+            jaka_driver::release_control(
+                control_owner, jaka_driver::ControlOwner::kCompliance);
+        }
     }
     if (request->data && ret != 0)
     {
@@ -1085,6 +1192,16 @@ void stop_move_callback(
     const auto owner = control_owner.load();
     if (auto server = trajectory_server.lock();
         owner == jaka_driver::ControlOwner::kTrajectory && server)
+    {
+        ret = server->request_stop();
+    }
+    else if (auto server = native_joint_move_server.lock();
+        owner == jaka_driver::ControlOwner::kNativeMotion && server)
+    {
+        ret = server->request_stop();
+    }
+    else if (auto server = native_cartesian_move_server.lock();
+        owner == jaka_driver::ControlOwner::kNativeCartesianMotion && server)
     {
         ret = server->request_stop();
     }
@@ -1808,6 +1925,80 @@ void login_callback(
     }
 }
 
+void get_rapid_rate_callback(
+    const std::shared_ptr<jaka_msgs::srv::GetRapidRate::Request>,
+    std::shared_ptr<jaka_msgs::srv::GetRapidRate::Response> response)
+{
+    std::lock_guard<std::mutex> lock(session_mutex);
+    if (!sdk_logged_in.load())
+    {
+        response->success = false;
+        response->error_code = -1;
+        response->message = "JAKA SDK 尚未登录";
+        return;
+    }
+    double rapid_rate = 0.0;
+    const int ret = robot.get_rapidrate(&rapid_rate);
+    response->success = ret == 0 && std::isfinite(rapid_rate) &&
+        rapid_rate >= 0.0 && rapid_rate <= 1.0;
+    response->error_code = ret;
+    response->rapid_rate = rapid_rate;
+    response->message = response->success ?
+        "JAKA 全局速度倍率读取成功" :
+        "JAKA 全局速度倍率读取失败: " + sdk_error_text(ret);
+}
+
+void set_rapid_rate_callback(
+    const std::shared_ptr<jaka_msgs::srv::SetRapidRate::Request> request,
+    std::shared_ptr<jaka_msgs::srv::SetRapidRate::Response> response)
+{
+    if (!std::isfinite(request->rapid_rate) || request->rapid_rate <= 0.0 ||
+        request->rapid_rate > 1.0)
+    {
+        response->success = false;
+        response->error_code = -2;
+        response->message = "rapid_rate 必须在 (0, 1] 内";
+        return;
+    }
+    ScopedLegacyControl ownership;
+    if (!ownership.acquired())
+    {
+        response->success = false;
+        response->error_code = -10;
+        response->message = std::string("运动期间禁止修改速度倍率; owner=") +
+            jaka_driver::control_owner_name(control_owner.load());
+        return;
+    }
+    std::lock_guard<std::mutex> lock(session_mutex);
+    if (!sdk_logged_in.load())
+    {
+        response->success = false;
+        response->error_code = -1;
+        response->message = "JAKA SDK 尚未登录";
+        return;
+    }
+    int ret = robot.set_rapidrate(request->rapid_rate);
+    double actual = 0.0;
+    if (ret == 0)
+    {
+        ret = robot.get_rapidrate(&actual);
+    }
+    response->success = ret == 0 && std::isfinite(actual) &&
+        actual > 0.0 && actual <= 1.0;
+    response->error_code = ret;
+    response->actual_rapid_rate = actual;
+    response->message = response->success ?
+        "JAKA 全局速度倍率设置并读回成功" :
+        "JAKA 全局速度倍率设置或读回失败: " + sdk_error_text(ret);
+    if (response->success)
+    {
+        RCLCPP_INFO(
+            rclcpp::get_logger("set_rapid_rate_callback"),
+            "JAKA RAPID RATE: requested=%.3f, actual=%.3f",
+            request->rapid_rate, actual);
+    }
+}
+
 void power_on_callback(
     const std::shared_ptr<std_srvs::srv::Trigger::Request>,
     std::shared_ptr<std_srvs::srv::Trigger::Response> response)
@@ -2110,9 +2301,12 @@ int main(int argc, char *argv[])
     auto disable_robot_service = node->create_service<std_srvs::srv::Trigger>("/jaka_driver/disable_robot", &disable_robot_callback, rmw_qos_profile_services_default, interrupt_callback_group);
     auto power_off_service = node->create_service<std_srvs::srv::Trigger>("/jaka_driver/power_off", &power_off_callback, rmw_qos_profile_services_default, sdk_callback_group);
     auto logout_service = node->create_service<std_srvs::srv::Trigger>("/jaka_driver/logout", &logout_callback, rmw_qos_profile_services_default, sdk_callback_group);
+    auto get_rapid_rate_service = node->create_service<jaka_msgs::srv::GetRapidRate>("/jaka_driver/get_rapid_rate", &get_rapid_rate_callback, rmw_qos_profile_services_default, sdk_callback_group);
+    auto set_rapid_rate_service = node->create_service<jaka_msgs::srv::SetRapidRate>("/jaka_driver/set_rapid_rate", &set_rapid_rate_callback, rmw_qos_profile_services_default, sdk_callback_group);
     auto ft_limit_service = node->create_service<jaka_msgs::srv::SetTorqueSensorSoftLimit>("/jaka_driver/set_ft_soft_limit", &set_torque_sensor_soft_limit_callback, rmw_qos_profile_services_default, sdk_callback_group);
     auto admittance_config_service = node->create_service<jaka_msgs::srv::SetAdmittanceConfig>("/jaka_driver/set_admittance_config", &set_admittance_config_callback, rmw_qos_profile_services_default, sdk_callback_group);
     auto force_control_frame_service = node->create_service<jaka_msgs::srv::SetForceControlFrame>("/jaka_driver/set_force_control_frame", &set_force_control_frame_callback, rmw_qos_profile_services_default, sdk_callback_group);
+    auto compliance_profile_service = node->create_service<jaka_msgs::srv::SetComplianceProfile>("/jaka_driver/set_compliance_profile", &set_compliance_profile_callback, rmw_qos_profile_services_default, sdk_callback_group);
     auto admittance_state_service = node->create_service<jaka_msgs::srv::GetAdmittanceState>("/jaka_driver/get_admittance_state", &get_admittance_state_callback, rmw_qos_profile_services_default, sdk_callback_group);
     auto admittance_enable_service = node->create_service<std_srvs::srv::SetBool>("/jaka_driver/enable_admittance", &enable_admittance_callback, rmw_qos_profile_services_default, interrupt_callback_group);
     auto zero_ft_service = node->create_service<std_srvs::srv::Trigger>("/jaka_driver/zero_ft_sensor", &zero_ft_sensor_callback, rmw_qos_profile_services_default, sdk_callback_group);
@@ -2131,6 +2325,24 @@ int main(int argc, char *argv[])
             session_mutex,
             "/jaka_s5_controller/follow_joint_trajectory");
     trajectory_server = trajectory_action_server;
+    auto native_joint_action_server =
+        std::make_shared<jaka_driver::NativeJointMoveServer>(
+            node,
+            robot,
+            sdk_logged_in,
+            control_owner,
+            session_mutex,
+            "/jaka_driver/execute_joint_move");
+    native_joint_move_server = native_joint_action_server;
+    auto native_cartesian_action_server =
+        std::make_shared<jaka_driver::NativeCartesianMoveServer>(
+            node,
+            robot,
+            sdk_logged_in,
+            control_owner,
+            session_mutex,
+            "/jaka_driver/execute_cartesian_move");
+    native_cartesian_move_server = native_cartesian_action_server;
 
     // Monitor network connection status
     thread conn_state_thread(get_conn_scoket_state);
@@ -2151,6 +2363,10 @@ int main(int argc, char *argv[])
         conn_state_thread.join();
     }
 
+    native_joint_action_server.reset();
+    native_joint_move_server.reset();
+    native_cartesian_action_server.reset();
+    native_cartesian_move_server.reset();
     trajectory_action_server.reset();
     trajectory_server.reset();
     wrench_pub.reset();

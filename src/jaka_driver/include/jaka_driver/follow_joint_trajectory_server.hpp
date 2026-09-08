@@ -56,6 +56,8 @@ private:
     bool robot_ready(std::string & error);
     int abort_motion_and_exit_servo();
     int exit_servo_mode();
+    int configure_servo_filter_locked(std::string & description);
+    std::string last_sdk_error_locked();
     void log_sdk_state_locked(const std::string & context);
     std::vector<double> reordered_positions(
         const std::vector<std::string> & names,
@@ -82,10 +84,18 @@ private:
     unsigned int maximum_servo_step_num_{50U};
     std::size_t maximum_servo_samples_{50000U};
     double maximum_trajectory_duration_{300.0};
-    double feedback_period_{0.1};
+    double feedback_period_{0.02};
+    double status_period_{0.05};
     bool capture_sdk_joint_velocity_{false};
     double sdk_joint_velocity_period_{1.0};
+    std::string servo_filter_mode_{"joint_lpf"};
     double servo_filter_cutoff_hz_{0.5};
+    double servo_nlf_max_velocity_deg_s_{0.0};
+    double servo_nlf_max_acceleration_deg_s2_{0.0};
+    double servo_nlf_max_jerk_deg_s3_{0.0};
+    int servo_foresight_max_buffer_{15};
+    double servo_foresight_kp_{0.03};
+    std::string error_code_file_path_;
     double maximum_queue_starvation_{0.008};
     std::size_t maximum_consecutive_starvations_{1U};
 

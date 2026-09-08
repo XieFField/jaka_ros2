@@ -88,7 +88,8 @@ void print_usage(const char * program)
 {
     std::cout
         << "用法: " << program << " [选项]\n"
-        << "  --preset joint1_negative_0p02|joint1_negative_0p10\n"
+        << "  --preset joint1_negative_0p02|joint1_negative_0p10|"
+           "joint1_negative_quintic_0p02|joint1_negative_quintic_0p10\n"
         << "  --input PATH              读取原始 Goal CSV，覆盖 preset\n"
         << "  --output PATH             输出 servo_j 调度 CSV\n"
         << "  --actual-initial q1,...,q6 诊断 Goal 起点与实际起点连续性\n"
@@ -192,12 +193,16 @@ trajectory_msgs::msg::JointTrajectory make_preset(const std::string & name)
 {
     double delta = 0.0;
     double duration = 0.0;
-    if (name == "joint1_negative_0p02")
+    jaka_driver::ScalarMotionProfile profile =
+        jaka_driver::ScalarMotionProfile::kLinear;
+    if (name == "joint1_negative_0p02" ||
+        name == "joint1_negative_quintic_0p02")
     {
         delta = -0.02;
         duration = 2.0;
     }
-    else if (name == "joint1_negative_0p10")
+    else if (name == "joint1_negative_0p10" ||
+        name == "joint1_negative_quintic_0p10")
     {
         delta = -0.10;
         duration = 5.0;
@@ -206,24 +211,32 @@ trajectory_msgs::msg::JointTrajectory make_preset(const std::string & name)
     {
         throw std::invalid_argument("未知 preset: " + name);
     }
+    if (name.find("quintic") != std::string::npos)
+    {
+        profile = jaka_driver::ScalarMotionProfile::kQuintic;
+    }
 
     trajectory_msgs::msg::JointTrajectory trajectory;
     trajectory.joint_names = kJointNames;
     constexpr std::size_t kIntervals = 20U;
     for (std::size_t index = 0U; index <= kIntervals; ++index)
     {
-        const double ratio = static_cast<double>(index) /
+        const double elapsed = duration * static_cast<double>(index) /
             static_cast<double>(kIntervals);
+        const auto sample = jaka_driver::sample_scalar_motion_profile(
+            profile, elapsed, duration);
+        if (!sample)
+        {
+            throw std::runtime_error("无法生成 preset 运动曲线");
+        }
         trajectory_msgs::msg::JointTrajectoryPoint point;
         point.positions = kHomePositions;
-        point.positions[0] += delta * ratio;
+        point.positions[0] += delta * sample->position_ratio;
         point.velocities.assign(kJointNames.size(), 0.0);
         point.accelerations.assign(kJointNames.size(), 0.0);
-        if (index > 0U && index < kIntervals)
-        {
-            point.velocities[0] = delta / duration;
-        }
-        set_duration(duration * ratio, point.time_from_start);
+        point.velocities[0] = delta * sample->velocity_ratio;
+        point.accelerations[0] = delta * sample->acceleration_ratio;
+        set_duration(elapsed, point.time_from_start);
         trajectory.points.push_back(std::move(point));
     }
     return trajectory;
@@ -408,9 +421,17 @@ int main(int argc, char ** argv)
             std::cout << kJointNames[joint]
                       << ": max_velocity="
                       << diagnostics.maximum_absolute_velocity[joint]
-                      << " rad/s, max_acceleration="
+                      << " rad/s, max_acceleration_with_boundaries="
                       << diagnostics.maximum_absolute_acceleration[joint]
-                      << " rad/s^2, positive_segments="
+                      << " rad/s^2, internal_acceleration="
+                      << diagnostics.maximum_absolute_internal_acceleration[joint]
+                      << " rad/s^2, boundary_acceleration="
+                      << diagnostics.maximum_absolute_boundary_acceleration[joint]
+                      << " rad/s^2, start_velocity_step="
+                      << diagnostics.start_velocity_step[joint]
+                      << " rad/s, stop_velocity_step="
+                      << diagnostics.stop_velocity_step[joint]
+                      << " rad/s, positive_segments="
                       << diagnostics.positive_velocity_segments[joint]
                       << ", negative_segments="
                       << diagnostics.negative_velocity_segments[joint]

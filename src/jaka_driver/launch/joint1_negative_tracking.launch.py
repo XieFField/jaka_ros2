@@ -12,6 +12,7 @@ def generate_launch_description():
         DeclareLaunchArgument("joint_delta", default_value="-0.02"),
         DeclareLaunchArgument("duration", default_value="2.0"),
         DeclareLaunchArgument("point_count", default_value="21"),
+        DeclareLaunchArgument("motion_profile", default_value="quintic"),
         DeclareLaunchArgument("endpoint_tolerance", default_value="0.002"),
         DeclareLaunchArgument("goal_time_tolerance", default_value="15.0"),
         DeclareLaunchArgument("state_timeout", default_value="3.0"),
@@ -43,6 +44,7 @@ def generate_launch_description():
                 "point_count": ParameterValue(
                     LaunchConfiguration("point_count"), value_type=int
                 ),
+                "motion_profile": LaunchConfiguration("motion_profile"),
                 "endpoint_tolerance": ParameterValue(
                     LaunchConfiguration("endpoint_tolerance"), value_type=float
                 ),

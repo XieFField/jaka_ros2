@@ -47,6 +47,60 @@ trajectory_msgs::msg::JointTrajectory dense_negative_trajectory(
     return trajectory;
 }
 
+trajectory_msgs::msg::JointTrajectory profiled_negative_trajectory(
+    jaka_driver::ScalarMotionProfile profile,
+    double delta,
+    double duration,
+    std::size_t intervals)
+{
+    trajectory_msgs::msg::JointTrajectory trajectory;
+    trajectory.joint_names = kExpectedJoints;
+    for (std::size_t index = 0U; index <= intervals; ++index)
+    {
+        const double elapsed = duration * static_cast<double>(index) /
+            static_cast<double>(intervals);
+        const auto sample = jaka_driver::sample_scalar_motion_profile(
+            profile, elapsed, duration);
+        EXPECT_TRUE(sample.has_value());
+        trajectory_msgs::msg::JointTrajectoryPoint point;
+        point.positions.assign(kExpectedJoints.size(), 0.0);
+        point.velocities.assign(kExpectedJoints.size(), 0.0);
+        point.accelerations.assign(kExpectedJoints.size(), 0.0);
+        point.positions[0] = delta * sample->position_ratio;
+        point.velocities[0] = delta * sample->velocity_ratio;
+        point.accelerations[0] = delta * sample->acceleration_ratio;
+        point.time_from_start.sec = static_cast<int32_t>(std::floor(elapsed));
+        point.time_from_start.nanosec = static_cast<uint32_t>(std::llround(
+            (elapsed - std::floor(elapsed)) * 1e9));
+        trajectory.points.push_back(std::move(point));
+    }
+    return trajectory;
+}
+
+TEST(TrajectoryUtilsTest, SamplesQuinticProfileWithZeroBoundaryDerivatives)
+{
+    const auto profile = jaka_driver::parse_scalar_motion_profile("quintic");
+    ASSERT_TRUE(profile.has_value());
+    const auto start = jaka_driver::sample_scalar_motion_profile(*profile, 0.0, 2.0);
+    const auto middle = jaka_driver::sample_scalar_motion_profile(*profile, 1.0, 2.0);
+    const auto finish = jaka_driver::sample_scalar_motion_profile(*profile, 2.0, 2.0);
+    ASSERT_TRUE(start.has_value());
+    ASSERT_TRUE(middle.has_value());
+    ASSERT_TRUE(finish.has_value());
+    EXPECT_DOUBLE_EQ(start->position_ratio, 0.0);
+    EXPECT_DOUBLE_EQ(start->velocity_ratio, 0.0);
+    EXPECT_DOUBLE_EQ(start->acceleration_ratio, 0.0);
+    EXPECT_NEAR(middle->position_ratio, 0.5, 1e-12);
+    EXPECT_GT(middle->velocity_ratio, 0.0);
+    EXPECT_NEAR(middle->acceleration_ratio, 0.0, 1e-12);
+    EXPECT_DOUBLE_EQ(finish->position_ratio, 1.0);
+    EXPECT_DOUBLE_EQ(finish->velocity_ratio, 0.0);
+    EXPECT_DOUBLE_EQ(finish->acceleration_ratio, 0.0);
+    EXPECT_FALSE(jaka_driver::sample_scalar_motion_profile(
+        *profile, 2.1, 2.0).has_value());
+    EXPECT_FALSE(jaka_driver::parse_scalar_motion_profile("unknown").has_value());
+}
+
 TEST(TrajectoryUtilsTest, AcceptsValidTrajectory)
 {
     std::string error;
@@ -331,6 +385,39 @@ TEST(TrajectoryUtilsTest, DiagnosesMonotonicNegativeJointOneSchedule)
     EXPECT_LT(diagnostics.duration_error, jaka_driver::kJakaServoInterpolationCycle);
     EXPECT_EQ(schedule.setpoints.front().source_velocities.size(), 6U);
     EXPECT_EQ(schedule.setpoints.front().source_accelerations.size(), 6U);
+}
+
+TEST(TrajectoryUtilsTest, IncludesStartAndStopTransitionsInAccelerationGate)
+{
+    const auto linear = profiled_negative_trajectory(
+        jaka_driver::ScalarMotionProfile::kLinear, -0.10, 5.0, 20U);
+    const auto smooth = profiled_negative_trajectory(
+        jaka_driver::ScalarMotionProfile::kQuintic, -0.10, 5.0, 20U);
+    const std::vector<double> actual_start(6, 0.0);
+    const auto linear_schedule = jaka_driver::build_queued_servo_schedule(
+        linear, kExpectedJoints, actual_start,
+        jaka_driver::kJakaServoInterpolationCycle, 50U, 100U);
+    const auto smooth_schedule = jaka_driver::build_queued_servo_schedule(
+        smooth, kExpectedJoints, actual_start,
+        jaka_driver::kJakaServoInterpolationCycle, 50U, 100U);
+    ASSERT_TRUE(linear_schedule.valid) << linear_schedule.error;
+    ASSERT_TRUE(smooth_schedule.valid) << smooth_schedule.error;
+
+    const auto linear_diagnostics = jaka_driver::analyze_queued_servo_schedule(
+        linear_schedule, actual_start);
+    const auto smooth_diagnostics = jaka_driver::analyze_queued_servo_schedule(
+        smooth_schedule, actual_start);
+    ASSERT_TRUE(linear_diagnostics.valid) << linear_diagnostics.error;
+    ASSERT_TRUE(smooth_diagnostics.valid) << smooth_diagnostics.error;
+    EXPECT_GT(linear_diagnostics.maximum_absolute_boundary_acceleration[0], 2.0);
+    EXPECT_GT(std::abs(linear_diagnostics.start_velocity_step[0]), 0.019);
+    EXPECT_GT(std::abs(linear_diagnostics.stop_velocity_step[0]), 0.019);
+    EXPECT_LT(smooth_diagnostics.maximum_absolute_boundary_acceleration[0], 0.1);
+    EXPECT_LT(
+        smooth_diagnostics.maximum_absolute_boundary_acceleration[0],
+        linear_diagnostics.maximum_absolute_boundary_acceleration[0]);
+    EXPECT_EQ(smooth_diagnostics.positive_velocity_segments[0], 0U);
+    EXPECT_EQ(smooth_diagnostics.velocity_sign_changes[0], 0U);
 }
 
 TEST(TrajectoryUtilsTest, DiagnosesGoalStartDiscontinuity)

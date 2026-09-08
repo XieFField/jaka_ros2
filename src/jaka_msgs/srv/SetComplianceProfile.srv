@@ -1,0 +1,19 @@
+# Sensor compensation state expected by the JAKA force-control mode.
+int32 sensor_compensation
+# 0: disabled, 1: constant-force compliance, 2: velocity compliance.
+int32 compliance_type
+# JAKA SDK linear units are millimetres per second.
+float64 compliance_linear_speed_limit_mm_s
+float64 compliance_angular_speed_limit_rad_s
+float64 approach_linear_speed_limit_mm_s
+float64 approach_angular_speed_limit_rad_s
+---
+bool success
+int32 error_code
+string message
+int32 actual_sensor_compensation
+int32 actual_compliance_type
+float64 actual_compliance_linear_speed_limit_mm_s
+float64 actual_compliance_angular_speed_limit_rad_s
+float64 actual_approach_linear_speed_limit_mm_s
+float64 actual_approach_angular_speed_limit_rad_s

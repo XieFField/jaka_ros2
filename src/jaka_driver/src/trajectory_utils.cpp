@@ -37,6 +37,54 @@ bool same_positions(
 
 }  // namespace
 
+std::optional<ScalarMotionProfile> parse_scalar_motion_profile(
+    const std::string & name)
+{
+    if (name == "linear")
+    {
+        return ScalarMotionProfile::kLinear;
+    }
+    if (name == "quintic")
+    {
+        return ScalarMotionProfile::kQuintic;
+    }
+    return std::nullopt;
+}
+
+std::optional<ScalarMotionSample> sample_scalar_motion_profile(
+    ScalarMotionProfile profile,
+    double elapsed,
+    double duration)
+{
+    if (!std::isfinite(elapsed) || !std::isfinite(duration) ||
+        duration <= 0.0 || elapsed < 0.0 || elapsed > duration)
+    {
+        return std::nullopt;
+    }
+
+    const double u = std::clamp(elapsed / duration, 0.0, 1.0);
+    ScalarMotionSample sample;
+    if (profile == ScalarMotionProfile::kLinear)
+    {
+        sample.position_ratio = u;
+        sample.velocity_ratio =
+            (u <= 0.0 || u >= 1.0) ? 0.0 : 1.0 / duration;
+        return sample;
+    }
+
+    const double u2 = u * u;
+    const double u3 = u2 * u;
+    const double u4 = u3 * u;
+    const double u5 = u4 * u;
+    sample.position_ratio = 10.0 * u3 - 15.0 * u4 + 6.0 * u5;
+    sample.velocity_ratio =
+        (30.0 * u2 - 60.0 * u3 + 30.0 * u4) / duration;
+    sample.acceleration_ratio =
+        (60.0 * u - 180.0 * u2 + 120.0 * u3) /
+        (duration * duration);
+    return sample;
+}
+
 bool validate_trajectory(
     const trajectory_msgs::msg::JointTrajectory & trajectory,
     const std::vector<std::string> & expected_joint_names,
@@ -377,7 +425,11 @@ ServoScheduleDiagnostics analyze_queued_servo_schedule(
 
     const auto joint_count = actual_initial_positions.size();
     diagnostics.maximum_absolute_velocity.assign(joint_count, 0.0);
+    diagnostics.maximum_absolute_internal_acceleration.assign(joint_count, 0.0);
     diagnostics.maximum_absolute_acceleration.assign(joint_count, 0.0);
+    diagnostics.start_velocity_step.assign(joint_count, 0.0);
+    diagnostics.stop_velocity_step.assign(joint_count, 0.0);
+    diagnostics.maximum_absolute_boundary_acceleration.assign(joint_count, 0.0);
     diagnostics.positive_velocity_segments.assign(joint_count, 0U);
     diagnostics.negative_velocity_segments.assign(joint_count, 0U);
     diagnostics.velocity_sign_changes.assign(joint_count, 0U);
@@ -420,8 +472,8 @@ ServoScheduleDiagnostics analyze_queued_servo_schedule(
             diagnostics.maximum_absolute_velocity[joint] = std::max(
                 diagnostics.maximum_absolute_velocity[joint],
                 std::abs(velocity));
-            diagnostics.maximum_absolute_acceleration[joint] = std::max(
-                diagnostics.maximum_absolute_acceleration[joint],
+            diagnostics.maximum_absolute_internal_acceleration[joint] = std::max(
+                diagnostics.maximum_absolute_internal_acceleration[joint],
                 std::abs(acceleration));
             const int sign = velocity > velocity_deadband ? 1 :
                 (velocity < -velocity_deadband ? -1 : 0);
@@ -443,6 +495,22 @@ ServoScheduleDiagnostics analyze_queued_servo_schedule(
                 previous_sign[joint] = sign;
             }
         }
+    }
+
+    for (std::size_t joint = 0U; joint < joint_count; ++joint)
+    {
+        diagnostics.start_velocity_step[joint] =
+            schedule.setpoints.front().implicit_velocities[joint];
+        diagnostics.stop_velocity_step[joint] =
+            -schedule.setpoints.back().implicit_velocities[joint];
+        diagnostics.maximum_absolute_boundary_acceleration[joint] =
+            std::max(
+            std::abs(diagnostics.start_velocity_step[joint]),
+            std::abs(diagnostics.stop_velocity_step[joint])) /
+            kJakaServoInterpolationCycle;
+        diagnostics.maximum_absolute_acceleration[joint] = std::max(
+            diagnostics.maximum_absolute_internal_acceleration[joint],
+            diagnostics.maximum_absolute_boundary_acceleration[joint]);
     }
     diagnostics.duration_error =
         schedule.scheduled_duration - schedule.planned_duration;

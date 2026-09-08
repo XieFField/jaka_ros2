@@ -14,6 +14,19 @@ namespace jaka_driver
 constexpr double kJakaServoInterpolationCycle = 0.008;
 constexpr unsigned int kMaximumServoStepNum = 50U;
 
+enum class ScalarMotionProfile
+{
+    kLinear,
+    kQuintic,
+};
+
+struct ScalarMotionSample
+{
+    double position_ratio{0.0};
+    double velocity_ratio{0.0};
+    double acceleration_ratio{0.0};
+};
+
 struct QueuedServoSetpoint
 {
     double controller_start_time{0.0};
@@ -52,7 +65,11 @@ struct ServoScheduleDiagnostics
     unsigned int minimum_step_num{0U};
     unsigned int maximum_step_num{0U};
     std::vector<double> maximum_absolute_velocity;
+    std::vector<double> maximum_absolute_internal_acceleration;
     std::vector<double> maximum_absolute_acceleration;
+    std::vector<double> start_velocity_step;
+    std::vector<double> stop_velocity_step;
+    std::vector<double> maximum_absolute_boundary_acceleration;
     std::vector<std::size_t> positive_velocity_segments;
     std::vector<std::size_t> negative_velocity_segments;
     std::vector<std::size_t> velocity_sign_changes;
@@ -88,6 +105,14 @@ struct EndpointProgress
 };
 
 // 与 JAKA S5 轨迹执行相关的纯校验和换序函数，保持与 SDK 解耦，便于离线测试。
+std::optional<ScalarMotionProfile> parse_scalar_motion_profile(
+    const std::string & name);
+
+std::optional<ScalarMotionSample> sample_scalar_motion_profile(
+    ScalarMotionProfile profile,
+    double elapsed,
+    double duration);
+
 bool validate_trajectory(
     const trajectory_msgs::msg::JointTrajectory & trajectory,
     const std::vector<std::string> & expected_joint_names,

@@ -1,0 +1,19 @@
+string request_id
+float64[] target_positions
+float64 speed
+float64 acceleration
+float64 endpoint_tolerance
+float64 timeout
+---
+bool success
+int32 sdk_error_code
+float64 max_joint_error
+string message
+---
+float64 elapsed
+bool in_position
+int32 queue_depth
+float64 max_joint_error
+bool powered
+bool enabled
+int32 controller_error_code

@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "control_msgs/action/follow_joint_trajectory.hpp"
+#include "jaka_driver/trajectory_utils.hpp"
 #include "jaka_msgs/msg/robot_msg.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
@@ -63,24 +64,29 @@ FollowJointTrajectory::Goal make_negative_goal(
     double joint_delta,
     double duration,
     std::size_t point_count,
+    jaka_driver::ScalarMotionProfile profile,
     double goal_time_tolerance)
 {
     FollowJointTrajectory::Goal goal;
     goal.trajectory.joint_names = kJointNames;
     for (std::size_t index = 0U; index < point_count; ++index)
     {
-        const double ratio = static_cast<double>(index) /
+        const double elapsed = duration * static_cast<double>(index) /
             static_cast<double>(point_count - 1U);
+        const auto sample = jaka_driver::sample_scalar_motion_profile(
+            profile, elapsed, duration);
+        if (!sample)
+        {
+            throw std::invalid_argument("无法生成固定 Goal 的运动曲线");
+        }
         trajectory_msgs::msg::JointTrajectoryPoint point;
         point.positions = initial_positions;
-        point.positions[0] += joint_delta * ratio;
+        point.positions[0] += joint_delta * sample->position_ratio;
         point.velocities.assign(kJointNames.size(), 0.0);
         point.accelerations.assign(kJointNames.size(), 0.0);
-        if (index > 0U && index + 1U < point_count)
-        {
-            point.velocities[0] = joint_delta / duration;
-        }
-        point.time_from_start = duration_from_seconds(duration * ratio);
+        point.velocities[0] = joint_delta * sample->velocity_ratio;
+        point.accelerations[0] = joint_delta * sample->acceleration_ratio;
+        point.time_from_start = duration_from_seconds(elapsed);
         goal.trajectory.points.push_back(std::move(point));
     }
     goal.goal_time_tolerance = duration_from_seconds(goal_time_tolerance);
@@ -108,6 +114,7 @@ int main(int argc, char ** argv)
     double joint_delta = -0.02;
     double duration = 2.0;
     int64_t point_count_parameter = 21;
+    std::string motion_profile_name = "quintic";
     double endpoint_tolerance = 0.002;
     double goal_time_tolerance = 15.0;
     double state_timeout = 3.0;
@@ -118,6 +125,8 @@ int main(int argc, char ** argv)
     node->get_parameter_or("joint_delta", joint_delta, -0.02);
     node->get_parameter_or("duration", duration, 2.0);
     node->get_parameter_or("point_count", point_count_parameter, int64_t{21});
+    node->get_parameter_or(
+        "motion_profile", motion_profile_name, std::string("quintic"));
     node->get_parameter_or("endpoint_tolerance", endpoint_tolerance, 0.002);
     node->get_parameter_or("goal_time_tolerance", goal_time_tolerance, 15.0);
     node->get_parameter_or("state_timeout", state_timeout, 3.0);
@@ -128,6 +137,8 @@ int main(int argc, char ** argv)
 
     const auto point_count = point_count_parameter > 0 ?
         static_cast<std::size_t>(point_count_parameter) : 0U;
+    const auto motion_profile = jaka_driver::parse_scalar_motion_profile(
+        motion_profile_name);
     if (!std::isfinite(joint_delta) || joint_delta >= -0.001 ||
         joint_delta < -0.10 || !std::isfinite(duration) || duration < 2.0 ||
         point_count < 3U || point_count > 1001U ||
@@ -136,12 +147,13 @@ int main(int argc, char ** argv)
         !std::isfinite(goal_time_tolerance) || goal_time_tolerance <= 0.0 ||
         !std::isfinite(state_timeout) || state_timeout <= 0.0 ||
         !std::isfinite(state_maximum_age) || state_maximum_age <= 0.0 ||
-        action_name.empty())
+        action_name.empty() || !motion_profile)
     {
         RCLCPP_ERROR(
             node->get_logger(),
             "参数无效：仅允许 joint_1 负向 [-0.10,-0.001) rad、"
-            "duration>=2 s、endpoint_tolerance<=0.01 rad");
+            "duration>=2 s、endpoint_tolerance<=0.01 rad，"
+            "motion_profile 仅允许 quintic 或 linear");
         rclcpp::shutdown();
         return 2;
     }
@@ -150,6 +162,16 @@ int main(int argc, char ** argv)
         RCLCPP_ERROR(
             node->get_logger(),
             "activate=true 时必须显式设置 parameters_confirmed:=true");
+        rclcpp::shutdown();
+        return 2;
+    }
+    if (activate &&
+        *motion_profile == jaka_driver::ScalarMotionProfile::kLinear)
+    {
+        RCLCPP_ERROR(
+            node->get_logger(),
+            "motion_profile=linear 仅允许离线诊断，不允许发送到真机；"
+            "请使用 motion_profile=quintic");
         rclcpp::shutdown();
         return 2;
     }
@@ -243,13 +265,14 @@ int main(int argc, char ** argv)
 
         const auto goal = make_negative_goal(
             initial_positions, joint_delta, duration, point_count,
-            goal_time_tolerance);
+            *motion_profile, goal_time_tolerance);
         RCLCPP_INFO(
             node->get_logger(),
             "固定负向 Goal 已生成: joint_1 initial=%.9f target=%.9f "
-            "delta=%.9f rad, duration=%.3f s, points=%zu, action=%s",
+            "delta=%.9f rad, duration=%.3f s, points=%zu, profile=%s, action=%s",
             initial_positions[0], initial_positions[0] + joint_delta,
-            joint_delta, duration, point_count, action_name.c_str());
+            joint_delta, duration, point_count, motion_profile_name.c_str(),
+            action_name.c_str());
 
         if (!activate)
         {
